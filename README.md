@@ -1,17 +1,47 @@
-Welcome to LightArch -- a middle ground between a heavy arch-based distribution and Arch itself (with an installer!).
+# LightArch
 
+A minimal, opinionated (in theory, not action) Arch-based Linux distribution. 
+More approachable than vanilla Arch. Less bloated than 
+Manjaro or EndeavourOS. Ships with Hyprland, SDDM, and 
+a no-nonsense installer - because GUIs are bloat and installing Arch manually takes far too long - that asks four questions and 
+gets out of your way.
 
-WARNING: THIS IS STILL IN THE BETA PHASE of development.
+>  LightArch 0.10 is a beta release. Expect rough edges.
+> Not recommended for your primary machine yet.
 
-Dependencies
+## Requirements
 
-- git and its Dependencies
-- archiso to build the ISO
+- x86_64 machine with UEFI
+- No NVIDIA. Consult the Arch wiki if you want NVIDIA support.
+- A USB stick and a network connection
 
-1.0: Getting the ISO image
+## Building the ISO
 
-Clone this repository, cd into it, and run sudo mkarchiso -v -w /tmp/work -o /tmp/out ~/LightArch/releng/. After the ISO is completely built, copy it out of /tmp/out/ and into your $HOME directory. Now write it to your thumb drive using balena etcher or ventoy.
+Dependencies: `git`, `archiso`
+```bash
+git clone https://github.com/kantiankant/lightarch
+cd lightarch
+sudo mkarchiso -v -w /tmp/work -o /tmp/out releng/
+cp /tmp/out/lightarch-0.10-x86_64.iso ~/
+```
 
-1.1: Installation
+Flash to USB with Ventoy. Boot from it.
 
-Boot into the live environment, then run lightarch-install. This will run the installation script. Just answer the questions and the installer will do everything for you.
+## Installing
+
+1. Connect to wifi if not on ethernet:
+```bash
+iwctl station wlan0 connect "YourNetwork"
+```
+
+2. Run the installer:
+```bash
+lightarch-install
+```
+
+Answer the questions. Everything else is automatic.
+
+## NVIDIA
+
+Not supported. Not planned for 0.10.
+Arch wiki: https://wiki.archlinux.org/title/NVIDIA
