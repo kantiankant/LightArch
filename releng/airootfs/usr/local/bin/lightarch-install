@@ -1,0 +1,360 @@
+#!/bin/bash
+
+# ============================================================
+#  _     _       _     _    _             _
+# | |   (_)     | |   | |  / \           | |
+# | |    _  __ _| |__ | |_/ _ \_ __ ___| |__
+# | |   | |/ _` | '_ \| __/ ___ \ '__/ __| '_ \
+# | |___| | (_| | | | | |_/ / \ \ | | (__| | | |
+# |_____|_|\__, |_| |_|\__\/   \/_|  \___|_| |_|
+#           __/ |
+#          |___/          0.10
+# ============================================================
+# Welcome to the LightArch installer.
+# This will wipe your entire disk and install LightArch.
+# NVIDIA is not supported. This requires UEFI.
+# ============================================================
+
+echo ""
+echo "Starting in 3 seconds. Last chance to leg it."
+sleep 3
+echo ""
+
+# ============================================================
+# WIFI
+# ============================================================
+echo ":: Checking network connectivity..."
+
+if ping -c 1 archlinux.org &>/dev/null; then
+  echo ":: Network detected. Skipping wifi setup."
+else
+  echo ":: No network detected. Let's connect to wifi."
+  echo ""
+  echo "   Available networks:"
+  iwctl station wlan0 scan
+  sleep 2
+  iwctl station wlan0 get-networks
+  echo ""
+  read -p "   Network name: " SSID
+  read -sp "   Password: " WIFI_PASS
+  echo ""
+  iwctl --passphrase "$WIFI_PASS" station wlan0 connect "$SSID"
+  sleep 3
+
+  if ping -c 1 archlinux.org &>/dev/null; then
+    echo ":: Connected."
+  else
+    echo ":: Failed to connect. Check your credentials and try again."
+    exit 1
+  fi
+fi
+
+echo ""
+
+# ============================================================
+# MIRRORS
+# ============================================================
+echo ":: Selecting fastest mirrors..."
+reflector --latest 10 --sort rate --save /etc/pacman.d/mirrorlist
+echo ":: Done."
+echo ""
+
+# ============================================================
+# DISK SELECTION
+# ============================================================
+echo ":: Available disks:"
+echo ""
+lsblk -d -o NAME,SIZE,MODEL | grep -v loop
+echo ""
+read -p "   Target disk (e.g. /dev/sda or /dev/nvme0n1): " DISK
+
+if [[ ! -b "$DISK" ]]; then
+  echo ":: Disk $DISK not found. Exiting."
+  exit 1
+fi
+
+DISK_SIZE=$(lsblk -bno SIZE "$DISK" | head -1)
+DISK_SIZE_GB=$((DISK_SIZE / 1024 / 1024 / 1024))
+SWAP_SIZE=$((DISK_SIZE / 1024 / 1024 / 10))M
+
+echo ""
+echo "   Disk:      $DISK"
+echo "   Size:      ${DISK_SIZE_GB}GB"
+echo "   Swap:      ${SWAP_SIZE} (10%)"
+echo "   Partition: EFI 512MB | Swap ${SWAP_SIZE} | Btrfs remainder"
+echo ""
+
+# ============================================================
+# USER DETAILS
+# ============================================================
+read -p "   Hostname : " HOSTNAME
+read -p "   Username : " USERNAME
+read -sp "   Password (root and user, same): " PASSWORD
+echo ""
+echo ""
+
+# ============================================================
+# TIMEZONE
+# ============================================================
+echo ":: Available regions:"
+ls /usr/share/zoneinfo/ | grep -v posix | grep -v right | grep -v '\.tab' | grep -v '\.list'
+echo ""
+read -p "   Region (e.g. Europe, America, Asia): " TZ_REGION
+echo ""
+echo ":: Available cities in $TZ_REGION:"
+ls /usr/share/zoneinfo/$TZ_REGION
+echo ""
+read -p "   City (e.g. London, New_York, Singapore): " TZ_CITY
+TIMEZONE="$TZ_REGION/$TZ_CITY"
+
+if [[ ! -f "/usr/share/zoneinfo/$TIMEZONE" ]]; then
+  echo ":: Timezone $TIMEZONE not found. Defaulting to UTC."
+  TIMEZONE="UTC"
+fi
+
+echo "   Timezone set to: $TIMEZONE"
+echo ""
+
+# ============================================================
+# LOCALE
+# ============================================================
+echo ":: Common locales:"
+echo "   1) en_US.UTF-8"
+echo "   2) en_GB.UTF-8"
+echo "   3) de_DE.UTF-8"
+echo "   4) fr_FR.UTF-8"
+echo "   5) ja_JP.UTF-8"
+echo "   6) zh_CN.UTF-8"
+echo "   7) Other (type manually)"
+echo ""
+read -p "   Choice [1-7]: " LOCALE_CHOICE
+
+case $LOCALE_CHOICE in
+1) LOCALE="en_US.UTF-8" ;;
+2) LOCALE="en_GB.UTF-8" ;;
+3) LOCALE="de_DE.UTF-8" ;;
+4) LOCALE="fr_FR.UTF-8" ;;
+5) LOCALE="ja_JP.UTF-8" ;;
+6) LOCALE="zh_CN.UTF-8" ;;
+7) read -p "   Enter locale (e.g. en_AU.UTF-8): " LOCALE ;;
+*) LOCALE="en_US.UTF-8" ;;
+esac
+
+echo "   Locale set to: $LOCALE"
+echo ""
+
+# ============================================================
+# CONFIRM
+# ============================================================
+echo "============================================================"
+echo "  Disk:     $DISK (${DISK_SIZE_GB}GB)"
+echo "  Hostname: $HOSTNAME"
+echo "  Username: $USERNAME"
+echo "  Timezone: $TIMEZONE"
+echo "  Locale:   $LOCALE"
+echo "============================================================"
+echo ""
+echo ":: About to wipe $DISK entirely. That's everything. Gone."
+read -p "   Are you sure? (yes/no): " CONFIRM
+if [[ "$CONFIRM" != "yes" ]]; then
+  echo ":: Wise choice. Exiting."
+  exit 0
+fi
+echo ""
+
+# ============================================================
+# PARTITION
+# ============================================================
+echo ":: Partitioning $DISK..."
+
+wipefs -af "$DISK"
+sgdisk \
+  -n1:0:+512M -t1:ef00 \
+  -n2:0:+${SWAP_SIZE} -t2:8200 \
+  -n3:0:0 -t3:8300 \
+  "$DISK"
+
+if [[ $DISK == *"nvme"* ]]; then
+  EFI="${DISK}p1"
+  SWAP="${DISK}p2"
+  ROOT="${DISK}p3"
+else
+  EFI="${DISK}1"
+  SWAP="${DISK}2"
+  ROOT="${DISK}3"
+fi
+
+mkfs.fat -F32 "$EFI"
+mkswap "$SWAP"
+swapon "$SWAP"
+mkfs.btrfs -f "$ROOT"
+
+mount "$ROOT" /mnt
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@snapshots
+btrfs subvolume create /mnt/@cache
+btrfs subvolume create /mnt/@log
+umount /mnt
+
+BTRFS_OPTS="noatime,compress=zstd,space_cache=v2"
+mount -o ${BTRFS_OPTS},subvol=@ "$ROOT" /mnt
+mkdir -p /mnt/{home,.snapshots,var/cache,var/log,boot/efi}
+mount -o ${BTRFS_OPTS},subvol=@home "$ROOT" /mnt/home
+mount -o ${BTRFS_OPTS},subvol=@snapshots "$ROOT" /mnt/.snapshots
+mount -o ${BTRFS_OPTS},subvol=@cache "$ROOT" /mnt/var/cache
+mount -o ${BTRFS_OPTS},subvol=@log "$ROOT" /mnt/var/log
+mount "$EFI" /mnt/boot/efi
+
+echo ":: Partitioned and mounted."
+echo ""
+
+# ============================================================
+# PACSTRAP
+# ============================================================
+echo ":: Installing base system. Put the kettle on."
+echo ""
+
+pacstrap /mnt \
+  base linux linux-firmware \
+  amd-ucode intel-ucode \
+  btrfs-progs \
+  grub efibootmgr \
+  iwd dhcpcd \
+  pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber \
+  hyprland hyprlock hypridle \
+  quickshell \
+  swww swayosd wofi mako \
+  playerctl wl-clipboard grim slurp \
+  ghostty \
+  git curl wget base-devel sudo \
+  dbus dbus-broker \
+  sof-firmware \
+  sddm \
+  xdg-user-dirs \
+  polkit || {
+  echo ""
+  echo ":: pacstrap failed. Are you connected to wifi?"
+  exit 1
+}
+
+genfstab -U /mnt >>/mnt/etc/fstab
+echo ":: Base system installed."
+echo ""
+
+# ============================================================
+# CONFIGURE
+# ============================================================
+echo ":: Configuring system..."
+
+arch-chroot /mnt /bin/bash <<EOF
+
+# Timezone and clock
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+hwclock --systohc
+
+# Locale
+echo "$LOCALE UTF-8" >> /etc/locale.gen
+locale-gen
+echo "LANG=$LOCALE" > /etc/locale.conf
+
+# Hostname
+echo "$HOSTNAME" > /etc/hostname
+cat > /etc/hosts <<HOSTS
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
+HOSTS
+
+# OS identity
+cat > /etc/os-release <<OSREL
+NAME="LightArch"
+PRETTY_NAME="LightArch 0.10"
+ID=lightarch
+ID_LIKE=arch
+BUILD_ID=0.10
+ANSI_COLOR="38;2;100;200;255"
+HOME_URL="https://github.com/kantiankant/lightarch"
+BUG_REPORT_URL="https://github.com/kantiankant/lightarch/issues"
+OSREL
+
+# User
+useradd -mG wheel,audio,video,input,storage -s /bin/bash "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
+echo "root:$PASSWORD" | chpasswd
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+# XDG dirs
+sudo -u $USERNAME xdg-user-dirs-update
+
+# iwd configuration
+mkdir -p /etc/iwd
+cat > /etc/iwd/main.conf <<IWD
+[General]
+EnableNetworkConfiguration=true
+
+[Network]
+NameResolvingService=resolvconf
+IWD
+
+# SDDM Wayland session
+mkdir -p /usr/share/wayland-sessions
+cat > /usr/share/wayland-sessions/hyprland.desktop <<DESK
+[Desktop Entry]
+Name=Hyprland
+Comment=An intelligent dynamic tiling Wayland compositor
+Exec=Hyprland
+Type=Application
+DesktopNames=Hyprland
+DESK
+
+# SDDM config
+mkdir -p /etc/sddm.conf.d
+cat > /etc/sddm.conf.d/10-wayland.conf <<SDDM
+[General]
+DisplayServer=wayland
+GreeterEnvironment=QT_WAYLAND_SHELL_INTEGRATION=layer-shell
+
+[Wayland]
+CompositorCommand=kwin_wayland --no-global-shortcuts --no-kactivities --inputmethod qtvirtualkeyboard
+SDDM
+
+# mkinitcpio — add btrfs
+sed -i 's/^MODULES=()/MODULES=(btrfs)/' /etc/mkinitcpio.conf
+mkinitcpio -P
+
+# Enable services
+systemctl enable iwd
+systemctl enable dhcpcd
+systemctl enable dbus
+systemctl enable sddm
+
+EOF
+
+echo ":: System configured."
+echo ""
+
+# ============================================================
+# GRUB
+# ============================================================
+echo ":: Installing GRUB..."
+
+arch-chroot /mnt /bin/bash <<EOF
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
+grub-mkconfig -o /boot/grub/grub.cfg
+EOF
+
+echo ":: GRUB installed."
+echo ""
+
+# ============================================================
+# DONE
+# ============================================================
+umount -R /mnt
+
+echo "============================================================"
+echo "  LightArch installed successfully."
+echo "  Type 'reboot' when ready."
+echo "  NVIDIA users: not our problem. Arch wiki. You know where."
+echo "============================================================"
+echo ""
