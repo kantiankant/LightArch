@@ -10,7 +10,7 @@ Dependencies
 
 1.0: Getting the ISO image
 
-Clone this repository, cd into it, and run mkarchiso -v -w /tmp/work -o /tmp/out ~/myiso/. After the ISO is completely built, copy it out of /tmp/out/ and into your $HOME directory. Now write it to your thumb drive using balena etcher or ventoy.
+Clone this repository, cd into it, and run sudo mkarchiso -v -w /tmp/work -o /tmp/out ~/LightArch/releng/. After the ISO is completely built, copy it out of /tmp/out/ and into your $HOME directory. Now write it to your thumb drive using balena etcher or ventoy.
 
 1.1: Installation
 
