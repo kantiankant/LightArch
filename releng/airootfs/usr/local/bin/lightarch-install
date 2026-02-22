@@ -1,180 +1,439 @@
 #!/bin/bash
 
 # ============================================================
-#  _     _       _     _    _             _
-# | |   (_)     | |   | |  / \           | |
-# | |    _  __ _| |__ | |_/ _ \_ __ ___| |__
-# | |   | |/ _` | '_ \| __/ ___ \ '__/ __| '_ \
-# | |___| | (_| | | | | |_/ / \ \ | | (__| | | |
-# |_____|_|\__, |_| |_|\__\/   \/_|  \___|_| |_|
-#           __/ |
-#          |___/          0.10
-# ============================================================
-# Welcome to the LightArch installer.
-# This will wipe your entire disk and install LightArch.
-# NVIDIA is not supported. This requires UEFI.
+#
+#   LightArch Installer  —  0.11
+#
+#   Just answer the questions.
+#   We'll handle the rest.
+#
 # ============================================================
 
+set -euo pipefail
+
+# ============================================================
+# COLOURS & FORMATTING
+# ============================================================
+
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+
+WHITE='\033[97m'
+BLUE='\033[38;5;75m'
+GREEN='\033[38;5;114m'
+YELLOW='\033[38;5;221m'
+RED='\033[38;5;203m'
+CYAN='\033[38;5;123m'
+GREY='\033[38;5;245m'
+
+# ============================================================
+# UI HELPERS
+# ============================================================
+
+# Clears screen and prints a clean header for each stage
+stage() {
+  clear
+  echo ""
+  echo -e "  ${BLUE}${BOLD}LightArch${RESET}  ${GREY}—  Installer 0.11${RESET}"
+  echo -e "  ${DIM}────────────────────────────────────────${RESET}"
+  echo ""
+  echo -e "  ${BOLD}${WHITE}$1${RESET}"
+  echo ""
+}
+
+# Green tick for success
+ok() {
+  echo -e "  ${GREEN}✓${RESET}  $1"
+}
+
+# Blue info line
+info() {
+  echo -e "  ${BLUE}→${RESET}  $1"
+}
+
+# Yellow warning
+warn() {
+  echo -e "  ${YELLOW}!${RESET}  $1"
+}
+
+# Red error, then exit
+die() {
+  echo ""
+  echo -e "  ${RED}✗  Something went wrong.${RESET}"
+  echo -e "  ${RED}   $1${RESET}"
+  echo ""
+  echo -e "  ${DIM}The installer has stopped. Nothing on your disk has been changed yet${RESET}"
+  echo -e "  ${DIM}(unless partitioning had already started).${RESET}"
+  echo ""
+  exit 1
+}
+
+# Spinner for long running tasks
+spinner() {
+  local pid=$1
+  local label=$2
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  ${BLUE}${frames[$i]}${RESET}  ${label}..."
+    i=$(((i + 1) % ${#frames[@]}))
+    sleep 0.08
+  done
+  printf "\r  ${GREEN}✓${RESET}  ${label}   \n"
+}
+
+# Simple progress bar (step N of TOTAL)
+progress() {
+  local step=$1
+  local total=$2
+  local label=$3
+  local filled=$((step * 30 / total))
+  local empty=$((30 - filled))
+  local bar=""
+  for ((i = 0; i < filled; i++)); do bar+="█"; done
+  for ((i = 0; i < empty; i++)); do bar+="░"; done
+  echo -e "  ${DIM}[${bar}]  ${step}/${total}  ${label}${RESET}"
+}
+
+# Ask a question, store result in REPLY
+ask() {
+  echo -ne "  ${CYAN}?${RESET}  ${BOLD}$1${RESET}  ${DIM}$2${RESET}\n  ${GREY}›${RESET} "
+  read -r REPLY
+}
+
+# Ask a secret (password), store in REPLY
+ask_secret() {
+  echo -ne "  ${CYAN}?${RESET}  ${BOLD}$1${RESET}\n  ${GREY}›${RESET} "
+  read -rs REPLY
+  echo ""
+}
+
+# Yes/no confirmation — returns 0 for yes, 1 for no
+confirm() {
+  echo -ne "  ${YELLOW}?${RESET}  ${BOLD}$1${RESET}  ${DIM}[y/N]${RESET}  "
+  read -r yn
+  [[ "$yn" =~ ^[Yy]$ ]]
+}
+
+# ============================================================
+# WELCOME SCREEN
+# ============================================================
+
+clear
 echo ""
-echo "Starting in 3 seconds. Last chance to leg it."
-sleep 3
 echo ""
+echo -e "  ${BLUE}${BOLD}"
+echo "       _     _       _     _    _             _     "
+echo "      | |   (_)     | |   | |  / \           | |    "
+echo "      | |    _  __ _| |__ | |_/ _ \_ __ ___| |__  "
+echo "      | |   | |/ _\` | '_ \| __/ ___ \ '__/ __| '_ \ "
+echo "      | |___| | (_| | | | | |_/ / \ \ | | (__| | | |"
+echo "      |_____|_|\__, |_| |_|\__\/   \/_|  \___|_| |_|"
+echo "                __/ |                               "
+echo "               |___/                        0.11    "
+echo -e "${RESET}"
+echo ""
+echo -e "  ${WHITE}${BOLD}Welcome to LightArch.${RESET}"
+echo ""
+echo -e "  ${DIM}This installer will guide you through setting up your system."
+echo -e "  It takes about 10–15 minutes depending on your connection."
+echo -e "  Your disk will be wiped. Everything else is handled for you.${RESET}"
+echo ""
+echo -e "  ${DIM}Requirements:  UEFI firmware  ·  Internet connection  ·  No NVIDIA${RESET}"
+echo ""
+echo -ne "  Press ${BOLD}Enter${RESET} to begin, or ${BOLD}Ctrl+C${RESET} to exit.  "
+read -r
 
 # ============================================================
-# WIFI
+# PREFLIGHT CHECKS
 # ============================================================
-echo ":: Checking network connectivity..."
 
-if ping -c 1 archlinux.org &>/dev/null; then
-  echo ":: Network detected. Skipping wifi setup."
+stage "Checking your system"
+
+info "Checking UEFI..."
+if [[ ! -d /sys/firmware/efi ]]; then
+  die "This system doesn't appear to be booted in UEFI mode. LightArch requires UEFI."
+fi
+ok "UEFI confirmed"
+
+info "Checking for NVIDIA GPU..."
+if lspci 2>/dev/null | grep -qi nvidia; then
+  echo ""
+  warn "An NVIDIA GPU was detected."
+  echo ""
+  echo -e "  ${DIM}LightArch doesn't support NVIDIA out of the box."
+  echo -e "  You can continue, but you may experience issues with Hyprland."
+  echo -e "  Check the Arch wiki for NVIDIA Wayland setup after install.${RESET}"
+  echo ""
+  confirm "Continue anyway?" || {
+    echo "  Exiting. Sensible."
+    exit 0
+  }
+fi
+ok "GPU check done"
+
+# ============================================================
+# NETWORK
+# ============================================================
+
+stage "Connecting to the internet"
+
+if ping -c 1 archlinux.org &>/dev/null 2>&1; then
+  ok "Already connected"
 else
-  echo ":: No network detected. Let's connect to wifi."
+  echo -e "  ${DIM}No connection detected. Let's get you online.${RESET}"
   echo ""
-  echo "   Available networks:"
-  iwctl station wlan0 scan
+
+  info "Scanning for networks..."
+  iwctl station wlan0 scan &>/dev/null
   sleep 2
-  iwctl station wlan0 get-networks
+
   echo ""
-  read -p "   Network name: " SSID
-  read -sp "   Password: " WIFI_PASS
+  echo -e "  ${DIM}Networks found:${RESET}"
   echo ""
-  iwctl --passphrase "$WIFI_PASS" station wlan0 connect "$SSID"
+  iwctl station wlan0 get-networks 2>/dev/null | tail -n +5 | head -20 | while read -r line; do
+    echo "     $line"
+  done
+  echo ""
+
+  ask "Network name (exactly as shown above)" ""
+  SSID="$REPLY"
+
+  ask_secret "Password"
+  WIFI_PASS="$REPLY"
+
+  info "Connecting to ${SSID}..."
+  iwctl --passphrase "$WIFI_PASS" station wlan0 connect "$SSID" 2>/dev/null
   sleep 3
 
-  if ping -c 1 archlinux.org &>/dev/null; then
-    echo ":: Connected."
+  if ping -c 1 archlinux.org &>/dev/null 2>&1; then
+    ok "Connected to ${SSID}"
   else
-    echo ":: Failed to connect. Check your credentials and try again."
-    exit 1
+    die "Couldn't connect to '${SSID}'. Check the name and password and run the installer again."
   fi
 fi
 
 echo ""
-
-# ============================================================
-# MIRRORS
-# ============================================================
-echo ":: Selecting fastest mirrors..."
-reflector --latest 10 --sort rate --save /etc/pacman.d/mirrorlist
-echo ":: Done."
-echo ""
+info "Finding the fastest mirrors. This takes a moment..."
+reflector --latest 10 --sort rate --save /etc/pacman.d/mirrorlist &>/dev/null &
+spinner $! "Optimising mirrors"
 
 # ============================================================
 # DISK SELECTION
 # ============================================================
-echo ":: Available disks:"
-echo ""
-lsblk -d -o NAME,SIZE,MODEL | grep -v loop
-echo ""
-read -p "   Target disk (e.g. /dev/sda or /dev/nvme0n1): " DISK
 
-if [[ ! -b "$DISK" ]]; then
-  echo ":: Disk $DISK not found. Exiting."
-  exit 1
-fi
+stage "Choose your disk"
 
-DISK_SIZE=$(lsblk -bno SIZE "$DISK" | head -1)
-DISK_SIZE_GB=$((DISK_SIZE / 1024 / 1024 / 1024))
-SWAP_SIZE=$((DISK_SIZE / 1024 / 1024 / 10))M
+echo -e "  ${DIM}These are the disks available on your system.${RESET}"
+echo -e "  ${DIM}The one you choose will be completely wiped.${RESET}"
+echo ""
+
+# Pretty disk list
+echo -e "  ${BOLD}  NAME          SIZE    MODEL${RESET}"
+echo -e "  ${DIM}  ──────────────────────────────────────────${RESET}"
+while IFS= read -r line; do
+  echo "     $line"
+done < <(lsblk -d -o NAME,SIZE,MODEL | grep -v loop | grep -v NAME)
+echo ""
+
+ask "Which disk? (e.g. sda, nvme0n1)" ""
+DISK_INPUT="$REPLY"
+DISK="/dev/${DISK_INPUT}"
+
+[[ -b "$DISK" ]] || die "Disk '${DISK}' not found. Double-check the name and try again."
+
+DISK_SIZE_BYTES=$(lsblk -bno SIZE "$DISK" | head -1)
+DISK_SIZE_GB=$((DISK_SIZE_BYTES / 1024 / 1024 / 1024))
+SWAP_MB=$((DISK_SIZE_BYTES / 1024 / 1024 / 10))
+SWAP_SIZE="${SWAP_MB}M"
 
 echo ""
-echo "   Disk:      $DISK"
-echo "   Size:      ${DISK_SIZE_GB}GB"
-echo "   Swap:      ${SWAP_SIZE} (10%)"
-echo "   Partition: EFI 512MB | Swap ${SWAP_SIZE} | Btrfs remainder"
+ok "Selected: ${BOLD}${DISK}${RESET}  (${DISK_SIZE_GB} GB)"
 echo ""
+echo -e "  ${DIM}Partition layout:${RESET}"
+echo -e "  ${DIM}  512 MB   →  EFI boot partition${RESET}"
+echo -e "  ${DIM}  ${SWAP_MB} MB   →  Swap (10% of disk)${RESET}"
+echo -e "  ${DIM}  Rest     →  System (btrfs, compressed)${RESET}"
 
 # ============================================================
 # USER DETAILS
 # ============================================================
-read -p "   Hostname : " HOSTNAME
-read -p "   Username : " USERNAME
-read -sp "   Password (root and user, same): " PASSWORD
+
+stage "Set up your account"
+
+echo -e "  ${DIM}This will be your main user account.${RESET}"
 echo ""
+
+ask "Your name" "(e.g. alice)"
+USERNAME="$REPLY"
+USERNAME="${USERNAME,,}" # lowercase
+
+# Validate username
+if ! [[ "$USERNAME" =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; then
+  die "Username '${USERNAME}' isn't valid. Use lowercase letters, numbers, hyphens, underscores."
+fi
+
+ask "Computer name" "(e.g. lightarch, mylaptop)"
+HOSTNAME="$REPLY"
+HOSTNAME="${HOSTNAME,,}"
+
+if ! [[ "$HOSTNAME" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
+  die "Hostname '${HOSTNAME}' isn't valid."
+fi
+
 echo ""
+echo -e "  ${DIM}Choose a password for your account and root.${RESET}"
+echo ""
+
+while true; do
+  ask_secret "Password"
+  PASS1="$REPLY"
+  ask_secret "Confirm password"
+  PASS2="$REPLY"
+  if [[ "$PASS1" == "$PASS2" ]]; then
+    PASSWORD="$PASS1"
+    ok "Password set"
+    break
+  else
+    warn "Passwords don't match. Try again."
+    echo ""
+  fi
+done
 
 # ============================================================
 # TIMEZONE
 # ============================================================
-echo ":: Available regions:"
-ls /usr/share/zoneinfo/ | grep -v posix | grep -v right | grep -v '\.tab' | grep -v '\.list'
-echo ""
-read -p "   Region (e.g. Europe, America, Asia): " TZ_REGION
-echo ""
-echo ":: Available cities in $TZ_REGION:"
-ls /usr/share/zoneinfo/$TZ_REGION
-echo ""
-read -p "   City (e.g. London, New_York, Singapore): " TZ_CITY
-TIMEZONE="$TZ_REGION/$TZ_CITY"
 
-if [[ ! -f "/usr/share/zoneinfo/$TIMEZONE" ]]; then
-  echo ":: Timezone $TIMEZONE not found. Defaulting to UTC."
-  TIMEZONE="UTC"
+stage "Where are you?"
+
+echo -e "  ${DIM}This sets your clock and timezone.${RESET}"
+echo ""
+
+# Try to auto-detect timezone
+DETECTED_TZ=""
+if command -v curl &>/dev/null; then
+  DETECTED_TZ=$(curl -s --max-time 3 https://ipapi.co/timezone 2>/dev/null || true)
 fi
 
-echo "   Timezone set to: $TIMEZONE"
-echo ""
+if [[ -n "$DETECTED_TZ" && -f "/usr/share/zoneinfo/$DETECTED_TZ" ]]; then
+  ok "Detected timezone: ${BOLD}${DETECTED_TZ}${RESET}"
+  echo ""
+  if confirm "Use this timezone?"; then
+    TIMEZONE="$DETECTED_TZ"
+    ok "Timezone set to ${TIMEZONE}"
+  else
+    DETECTED_TZ=""
+  fi
+fi
+
+if [[ -z "$DETECTED_TZ" ]]; then
+  echo -e "  ${DIM}Available regions:${RESET}"
+  echo ""
+  ls /usr/share/zoneinfo/ | grep -vE 'posix|right|\.tab|\.list|leap' | paste - - - - | while read -r line; do
+    echo "     $line"
+  done
+  echo ""
+  ask "Region" "(e.g. Europe, America, Asia)"
+  TZ_REGION="$REPLY"
+
+  echo ""
+  echo -e "  ${DIM}Cities in ${TZ_REGION}:${RESET}"
+  echo ""
+  ls "/usr/share/zoneinfo/$TZ_REGION" 2>/dev/null | paste - - - - | while read -r line; do
+    echo "     $line"
+  done || die "Region '${TZ_REGION}' not found."
+  echo ""
+
+  ask "City" "(e.g. London, New_York, Singapore)"
+  TZ_CITY="$REPLY"
+  TIMEZONE="${TZ_REGION}/${TZ_CITY}"
+
+  [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || {
+    warn "Timezone '${TIMEZONE}' not found. Defaulting to UTC."
+    TIMEZONE="UTC"
+  }
+  ok "Timezone set to ${TIMEZONE}"
+fi
 
 # ============================================================
 # LOCALE
 # ============================================================
-echo ":: Common locales:"
-echo "   1) en_US.UTF-8"
-echo "   2) en_GB.UTF-8"
-echo "   3) de_DE.UTF-8"
-echo "   4) fr_FR.UTF-8"
-echo "   5) ja_JP.UTF-8"
-echo "   6) zh_CN.UTF-8"
-echo "   7) Other (type manually)"
-echo ""
-read -p "   Choice [1-7]: " LOCALE_CHOICE
 
-case $LOCALE_CHOICE in
-1) LOCALE="en_US.UTF-8" ;;
+stage "Language and locale"
+
+echo -e "  ${DIM}Choose your system language.${RESET}"
+echo ""
+echo -e "     ${BOLD}1)${RESET}  English (US)     en_US.UTF-8"
+echo -e "     ${BOLD}2)${RESET}  English (UK)     en_GB.UTF-8"
+echo -e "     ${BOLD}3)${RESET}  German           de_DE.UTF-8"
+echo -e "     ${BOLD}4)${RESET}  French           fr_FR.UTF-8"
+echo -e "     ${BOLD}5)${RESET}  Japanese         ja_JP.UTF-8"
+echo -e "     ${BOLD}6)${RESET}  Chinese (S)      zh_CN.UTF-8"
+echo -e "     ${BOLD}7)${RESET}  Other"
+echo ""
+
+ask "Choice" "[1–7, default 1]"
+case "$REPLY" in
 2) LOCALE="en_GB.UTF-8" ;;
 3) LOCALE="de_DE.UTF-8" ;;
 4) LOCALE="fr_FR.UTF-8" ;;
 5) LOCALE="ja_JP.UTF-8" ;;
 6) LOCALE="zh_CN.UTF-8" ;;
-7) read -p "   Enter locale (e.g. en_AU.UTF-8): " LOCALE ;;
+7)
+  ask "Locale" "(e.g. en_AU.UTF-8)"
+  LOCALE="$REPLY"
+  ;;
 *) LOCALE="en_US.UTF-8" ;;
 esac
 
-echo "   Locale set to: $LOCALE"
-echo ""
+ok "Language set to ${LOCALE}"
 
 # ============================================================
-# CONFIRM
+# REVIEW & CONFIRM
 # ============================================================
-echo "============================================================"
-echo "  Disk:     $DISK (${DISK_SIZE_GB}GB)"
-echo "  Hostname: $HOSTNAME"
-echo "  Username: $USERNAME"
-echo "  Timezone: $TIMEZONE"
-echo "  Locale:   $LOCALE"
-echo "============================================================"
+
+stage "Ready to install"
+
+echo -e "  Here's what we're about to do:\n"
+echo -e "  ${GREY}──────────────────────────────────────────${RESET}"
+echo -e "  ${DIM}Disk${RESET}        ${BOLD}${DISK}${RESET}  (${DISK_SIZE_GB} GB — ${RED}will be wiped${RESET})"
+echo -e "  ${DIM}User${RESET}        ${BOLD}${USERNAME}${RESET}"
+echo -e "  ${DIM}Hostname${RESET}    ${BOLD}${HOSTNAME}${RESET}"
+echo -e "  ${DIM}Timezone${RESET}    ${BOLD}${TIMEZONE}${RESET}"
+echo -e "  ${DIM}Language${RESET}    ${BOLD}${LOCALE}${RESET}"
+echo -e "  ${GREY}──────────────────────────────────────────${RESET}"
 echo ""
-echo ":: About to wipe $DISK entirely. That's everything. Gone."
-read -p "   Are you sure? (yes/no): " CONFIRM
-if [[ "$CONFIRM" != "yes" ]]; then
-  echo ":: Wise choice. Exiting."
+echo -e "  ${DIM}Filesystem:  btrfs with zstd compression, 5 subvolumes${RESET}"
+echo -e "  ${DIM}Desktop:     Hyprland (Wayland) + SDDM${RESET}"
+echo -e "  ${DIM}Audio:       PipeWire${RESET}"
+echo -e "  ${DIM}Shell:       zsh${RESET}"
+echo ""
+warn "This will permanently erase everything on ${DISK}."
+echo ""
+
+confirm "Start the installation?" || {
+  echo "  Exiting. Nothing was changed."
   exit 0
-fi
+}
+
+# ============================================================
+# PARTITIONING
+# ============================================================
+
+stage "Preparing your disk"
+
 echo ""
+progress 1 6 "Partitioning"
 
-# ============================================================
-# PARTITION
-# ============================================================
-echo ":: Partitioning $DISK..."
-
-wipefs -af "$DISK"
+wipefs -af "$DISK" &>/dev/null
 sgdisk \
   -n1:0:+512M -t1:ef00 \
   -n2:0:+${SWAP_SIZE} -t2:8200 \
   -n3:0:0 -t3:8300 \
-  "$DISK"
+  "$DISK" &>/dev/null
 
-if [[ $DISK == *"nvme"* ]]; then
+if [[ "$DISK" == *"nvme"* ]]; then
   EFI="${DISK}p1"
   SWAP="${DISK}p2"
   ROOT="${DISK}p3"
@@ -184,35 +443,43 @@ else
   ROOT="${DISK}3"
 fi
 
-mkfs.fat -F32 "$EFI"
-mkswap "$SWAP"
-swapon "$SWAP"
-mkfs.btrfs -f "$ROOT"
+progress 2 6 "Formatting EFI partition"
+mkfs.fat -F32 "$EFI" &>/dev/null
 
+progress 3 6 "Formatting swap"
+mkswap "$SWAP" &>/dev/null
+swapon "$SWAP"
+
+progress 4 6 "Formatting root (btrfs)"
+mkfs.btrfs -f "$ROOT" &>/dev/null
+
+progress 5 6 "Creating subvolumes"
 mount "$ROOT" /mnt
-btrfs subvolume create /mnt/@
-btrfs subvolume create /mnt/@home
-btrfs subvolume create /mnt/@snapshots
-btrfs subvolume create /mnt/@cache
-btrfs subvolume create /mnt/@log
+for sv in @ @home @snapshots @cache @log; do
+  btrfs subvolume create "/mnt/${sv}" &>/dev/null
+done
 umount /mnt
 
+progress 6 6 "Mounting everything"
 BTRFS_OPTS="noatime,compress=zstd,space_cache=v2"
-mount -o ${BTRFS_OPTS},subvol=@ "$ROOT" /mnt
+mount -o "${BTRFS_OPTS},subvol=@" "$ROOT" /mnt
 mkdir -p /mnt/{home,.snapshots,var/cache,var/log,boot/efi}
-mount -o ${BTRFS_OPTS},subvol=@home "$ROOT" /mnt/home
-mount -o ${BTRFS_OPTS},subvol=@snapshots "$ROOT" /mnt/.snapshots
-mount -o ${BTRFS_OPTS},subvol=@cache "$ROOT" /mnt/var/cache
-mount -o ${BTRFS_OPTS},subvol=@log "$ROOT" /mnt/var/log
+mount -o "${BTRFS_OPTS},subvol=@home" "$ROOT" /mnt/home
+mount -o "${BTRFS_OPTS},subvol=@snapshots" "$ROOT" /mnt/.snapshots
+mount -o "${BTRFS_OPTS},subvol=@cache" "$ROOT" /mnt/var/cache
+mount -o "${BTRFS_OPTS},subvol=@log" "$ROOT" /mnt/var/log
 mount "$EFI" /mnt/boot/efi
 
-echo ":: Partitioned and mounted."
-echo ""
+ok "Disk ready"
 
 # ============================================================
-# PACSTRAP
+# INSTALL PACKAGES
 # ============================================================
-echo ":: Installing base system. Put the kettle on."
+
+stage "Installing LightArch"
+
+echo -e "  ${DIM}Downloading and installing packages."
+echo -e "  This is the longest step. Good time for that cup of tea.${RESET}"
 echo ""
 
 pacstrap /mnt \
@@ -220,7 +487,7 @@ pacstrap /mnt \
   amd-ucode intel-ucode \
   btrfs-progs \
   grub efibootmgr \
-  iwd dhcpcd \
+  iwd \
   pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber \
   hyprland hyprlock hypridle \
   quickshell \
@@ -232,129 +499,156 @@ pacstrap /mnt \
   sof-firmware \
   sddm \
   xdg-user-dirs \
-  polkit || {
+  polkit \
+  zsh \
+  fastfetch \
+  noto-fonts noto-fonts-emoji ttf-jetbrains-mono-nerd \
+  2>&1 | while IFS= read -r line; do
+  if [[ "$line" == *"installing"* ]] || [[ "$line" == *"Packages"* ]]; then
+    echo -e "  ${DIM}${line}${RESET}"
+  fi
+done || die "Package installation failed. Check your internet connection."
+
+genfstab -U /mnt >>/mnt/etc/fstab
+ok "Packages installed"
+
+# ============================================================
+# CONFIGURE SYSTEM
+# ============================================================
+
+stage "Configuring your system"
+
+# Write the chroot script to a file rather than a heredoc
+# This avoids nested heredoc nightmares and sudo issues
+cat >/mnt/lightarch-configure.sh <<SCRIPT
+#!/bin/bash
+set -e
+
+RESET='\033[0m'
+BOLD='\033[1m'
+DIM='\033[2m'
+GREEN='\033[38;5;114m'
+
+progress() {
+  local step=\$1
+  local total=\$2
+  local label=\$3
+  local filled=\$(( step * 30 / total ))
+  local empty=\$(( 30 - filled ))
+  local bar=""
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=0; i<empty; i++)); do bar+="░"; done
+  echo -e "  \${DIM}[\${bar}]  \${step}/\${total}  \${label}\${RESET}"
+}
+
+trap 'echo -e "\n  \033[38;5;203m✗  Configuration failed at line \$LINENO. Check /tmp/lightarch-error.log\033[0m\n"; exit 1' ERR
+
+# ── Timezone ───────────────────────────────────────────────
+progress 1 8 "Setting timezone and clock"
+ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
+hwclock --systohc
+
+# ── Locale ────────────────────────────────────────────────
+progress 2 8 "Setting language"
+echo "${LOCALE} UTF-8" >> /etc/locale.gen
+locale-gen &>/dev/null
+echo "LANG=${LOCALE}" > /etc/locale.conf
+
+# ── Hostname ──────────────────────────────────────────────
+progress 3 8 "Configuring hostname"
+echo "${HOSTNAME}" > /etc/hostname
+printf '127.0.0.1   localhost\n::1         localhost\n127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}\n' > /etc/hosts
+
+# ── OS identity ───────────────────────────────────────────
+printf 'NAME="LightArch"\nPRETTY_NAME="LightArch 0.11"\nID=lightarch\nID_LIKE=arch\nBUILD_ID=0.11\nANSI_COLOR="38;2;100;200;255"\nHOME_URL="https://github.com/kantiankant/lightarch"\nBUG_REPORT_URL="https://github.com/kantiankant/lightarch/issues"\n' > /etc/os-release
+
+# ── User ──────────────────────────────────────────────────
+progress 4 8 "Creating your account"
+useradd -mG wheel,audio,video,input,storage -s /bin/zsh "${USERNAME}"
+echo "${USERNAME}:${PASSWORD}" | chpasswd
+echo "root:${PASSWORD}" | chpasswd
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+# ── XDG dirs ─────────────────────────────────────────────
+su - "${USERNAME}" -c "xdg-user-dirs-update" &>/dev/null || true
+
+# ── PipeWire (user service symlinks) ─────────────────────
+progress 5 8 "Enabling audio"
+WANTS_DIR="/home/${USERNAME}/.config/systemd/user/default.target.wants"
+mkdir -p "\$WANTS_DIR"
+ln -sf /usr/lib/systemd/user/pipewire.service       "\$WANTS_DIR/pipewire.service"
+ln -sf /usr/lib/systemd/user/pipewire-pulse.service "\$WANTS_DIR/pipewire-pulse.service"
+ln -sf /usr/lib/systemd/user/wireplumber.service    "\$WANTS_DIR/wireplumber.service"
+chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
+
+# ── iwd ──────────────────────────────────────────────────
+progress 6 8 "Configuring desktop"
+mkdir -p /etc/iwd
+printf '[General]\nEnableNetworkConfiguration=true\n\n[Network]\nNameResolvingService=resolvconf\n' > /etc/iwd/main.conf
+
+# ── Wayland session entry ─────────────────────────────────
+mkdir -p /usr/share/wayland-sessions
+printf '[Desktop Entry]\nName=Hyprland\nComment=An intelligent dynamic tiling Wayland compositor\nExec=Hyprland\nType=Application\nDesktopNames=Hyprland\n' > /usr/share/wayland-sessions/hyprland.desktop
+
+# ── SDDM ─────────────────────────────────────────────────
+mkdir -p /etc/sddm.conf.d
+printf '[General]\nDisplayServer=wayland\nGreeterEnvironment=QT_WAYLAND_SHELL_INTEGRATION=layer-shell\n\n[Wayland]\nCompositorCommand=kwin_wayland --no-global-shortcuts --no-kactivities --inputmethod qtvirtualkeyboard\n' > /etc/sddm.conf.d/10-wayland.conf
+
+# ── mkinitcpio ────────────────────────────────────────────
+progress 7 8 "Building kernel"
+echo "KEYMAP=us" > /etc/vconsole.conf
+sed -i 's/^MODULES=()/MODULES=(btrfs)/' /etc/mkinitcpio.conf
+mkinitcpio -P 2>&1 | grep -E "ERROR|WARNING" || true
+
+# ── Services ─────────────────────────────────────────────
+systemctl enable iwd    &>/dev/null
+systemctl enable dbus   &>/dev/null
+systemctl enable sddm   &>/dev/null
+
+# ── GRUB ─────────────────────────────────────────────────
+progress 8 8 "Setting up boot"
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB &>/dev/null
+grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null
+
+echo -e "  \${GREEN}✓\${RESET}  System configured"
+SCRIPT
+
+chmod +x /mnt/lightarch-configure.sh
+arch-chroot /mnt /bin/bash /lightarch-configure.sh 2>/tmp/lightarch-error.log || {
   echo ""
-  echo ":: pacstrap failed. Are you connected to wifi?"
+  echo -e "  ${RED}✗  Configuration failed.${RESET}"
+  echo -e "  ${DIM}Error log: /tmp/lightarch-error.log${RESET}"
+  echo -e "  ${DIM}Run: cat /tmp/lightarch-error.log${RESET}"
+  echo ""
   exit 1
 }
 
-genfstab -U /mnt >>/mnt/etc/fstab
-echo ":: Base system installed."
-echo ""
-
-# ============================================================
-# CONFIGURE
-# ============================================================
-echo ":: Configuring system..."
-
-arch-chroot /mnt /bin/bash <<EOF
-
-# Timezone and clock
-ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
-hwclock --systohc
-
-# Locale
-echo "$LOCALE UTF-8" >> /etc/locale.gen
-locale-gen
-echo "LANG=$LOCALE" > /etc/locale.conf
-
-# Hostname
-echo "$HOSTNAME" > /etc/hostname
-cat > /etc/hosts <<HOSTS
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
-HOSTS
-
-# OS identity
-cat > /etc/os-release <<OSREL
-NAME="LightArch"
-PRETTY_NAME="LightArch 0.10"
-ID=lightarch
-ID_LIKE=arch
-BUILD_ID=0.10
-ANSI_COLOR="38;2;100;200;255"
-HOME_URL="https://github.com/kantiankant/lightarch"
-BUG_REPORT_URL="https://github.com/kantiankant/lightarch/issues"
-OSREL
-
-# User
-useradd -mG wheel,audio,video,input,storage -s /bin/bash "$USERNAME"
-echo "$USERNAME:$PASSWORD" | chpasswd
-echo "root:$PASSWORD" | chpasswd
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
-
-# XDG dirs
-sudo -u $USERNAME xdg-user-dirs-update
-
-# iwd configuration
-mkdir -p /etc/iwd
-cat > /etc/iwd/main.conf <<IWD
-[General]
-EnableNetworkConfiguration=true
-
-[Network]
-NameResolvingService=resolvconf
-IWD
-
-# SDDM Wayland session
-mkdir -p /usr/share/wayland-sessions
-cat > /usr/share/wayland-sessions/hyprland.desktop <<DESK
-[Desktop Entry]
-Name=Hyprland
-Comment=An intelligent dynamic tiling Wayland compositor
-Exec=Hyprland
-Type=Application
-DesktopNames=Hyprland
-DESK
-
-# SDDM config
-mkdir -p /etc/sddm.conf.d
-cat > /etc/sddm.conf.d/10-wayland.conf <<SDDM
-[General]
-DisplayServer=wayland
-GreeterEnvironment=QT_WAYLAND_SHELL_INTEGRATION=layer-shell
-
-[Wayland]
-CompositorCommand=kwin_wayland --no-global-shortcuts --no-kactivities --inputmethod qtvirtualkeyboard
-SDDM
-
-# mkinitcpio — add btrfs
-sed -i 's/^MODULES=()/MODULES=(btrfs)/' /etc/mkinitcpio.conf
-mkinitcpio -P
-
-# Enable services
-systemctl enable iwd
-systemctl enable dhcpcd
-systemctl enable dbus
-systemctl enable sddm
-
-EOF
-
-echo ":: System configured."
-echo ""
-
-# ============================================================
-# GRUB
-# ============================================================
-echo ":: Installing GRUB..."
-
-arch-chroot /mnt /bin/bash <<EOF
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
-grub-mkconfig -o /boot/grub/grub.cfg
-EOF
-
-echo ":: GRUB installed."
-echo ""
+# Clean up
+rm -f /mnt/lightarch-configure.sh
 
 # ============================================================
 # DONE
 # ============================================================
+
 umount -R /mnt
 
-echo "============================================================"
-echo "  LightArch installed successfully."
-echo "  Type 'reboot' when ready."
-echo "  NVIDIA users: not our problem. Arch wiki. You know where."
-echo "============================================================"
+clear
+echo ""
+echo ""
+echo -e "  ${GREEN}${BOLD}Installation complete.${RESET}"
+echo ""
+echo -e "  ${WHITE}LightArch is ready.${RESET}"
+echo ""
+echo -e "  ${DIM}What just happened:${RESET}"
+echo -e "  ${DIM}  ✓  LightArch installed to ${DISK}${RESET}"
+echo -e "  ${DIM}  ✓  Account '${USERNAME}' created${RESET}"
+echo -e "  ${DIM}  ✓  Hyprland + SDDM configured${RESET}"
+echo -e "  ${DIM}  ✓  PipeWire audio enabled${RESET}"
+echo -e "  ${DIM}  ✓  System boots automatically to login screen${RESET}"
+echo ""
+echo -e "  ${DIM}Type ${RESET}${BOLD}reboot${RESET}${DIM} when you're ready.${RESET}"
+echo ""
+echo -e "  ${GREY}──────────────────────────────────────────${RESET}"
+echo -e "  ${DIM}NVIDIA users: the Arch wiki is your friend.${RESET}"
+echo -e "  ${DIM}github.com/kantiankant/lightarch${RESET}"
 echo ""

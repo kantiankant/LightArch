@@ -6,7 +6,7 @@ Manjaro or EndeavourOS. Ships with Hyprland, SDDM, and
 a no-nonsense installer - because GUIs are bloat and installing Arch manually takes far too long - that asks four questions and 
 gets out of your way.
 
->  LightArch 0.10 is a beta release. Expect rough edges.
+>  LightArch 0.11 is a beta release. Expect rough edges.
 > Not recommended for your primary machine yet.
 
 ## Requirements
@@ -22,7 +22,7 @@ Dependencies: `git`, `archiso`
 git clone https://github.com/kantiankant/lightarch
 cd lightarch
 sudo mkarchiso -v -w /tmp/work -o /tmp/out releng/
-cp /tmp/out/lightarch-0.10-x86_64.iso ~/
+cp /tmp/out/lightarch-0.11-x86_64.iso ~/
 ```
 
 Flash to USB with Ventoy. Boot from it.
@@ -31,7 +31,7 @@ Flash to USB with Ventoy. Boot from it.
 
 1. Connect to wifi if not on ethernet:
 ```bash
-iwctl station wlan0 connect "YourNetwork"
+iwctl --passphrase "YourPassword" station wlan0 connect "YourNetwork"
 ```
 
 2. Run the installer:
@@ -43,5 +43,6 @@ Answer the questions. Everything else is automatic.
 
 ## NVIDIA
 
-Not supported. Not planned for 0.10.
-Arch wiki: https://wiki.archlinux.org/title/NVIDIA
+Not supported. Planned for 1.0-RELEASE, or when this educational project gets enough support.But if you want NVIDIA support, see: 
+
+> Arch wiki: https://wiki.archlinux.org/title/NVIDIA
