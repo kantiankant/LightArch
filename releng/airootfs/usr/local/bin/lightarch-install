@@ -1466,7 +1466,7 @@ def install_packages(ui: TUI, cfg: InstallConfig):
         "playerctl", "wl-clipboard", "grim", "slurp",
         "xdg-desktop-portal-hyprland",
         # Terminal
-        "Kitty",
+        "kitty",
         # Display manager
         "sddm",
         # XDG
