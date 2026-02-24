@@ -1,654 +1,2137 @@
-#!/bin/bash
-
+#!/usr/bin/env python3
 # ============================================================
 #
-#   LightArch Installer  —  0.11
+#   LightArch Installer  —  0.12
 #
-#   Just answer the questions.
-#   We'll handle the rest.
+#   Rewritten for stability.
+#   Inspired by tonarchy's zero-dependency robustness
+#   and omarchy's opinionated clarity.
+#
+#   Requirements:
+#     - Python 3.10+  (stdlib only)
+#     - Root
+#     - Arch Linux live ISO environment
 #
 # ============================================================
 
-set -euo pipefail
+import curses
+import os
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
 
 # ============================================================
-# COLOURS & FORMATTING
+# VERSION
 # ============================================================
 
-RESET='\033[0m'
-BOLD='\033[1m'
-DIM='\033[2m'
+VERSION = "0.12"
 
-WHITE='\033[97m'
-BLUE='\033[38;5;75m'
-GREEN='\033[38;5;114m'
-YELLOW='\033[38;5;221m'
-RED='\033[38;5;203m'
-CYAN='\033[38;5;123m'
-GREY='\033[38;5;245m'
 
 # ============================================================
-# UI HELPERS
+# COLOUR PAIRS  (curses pair IDs)
 # ============================================================
 
-# Clears screen and prints a clean header for each stage
-stage() {
-  clear
-  echo ""
-  echo -e "  ${BLUE}${BOLD}LightArch${RESET}  ${GREY}—  Installer 0.11${RESET}"
-  echo -e "  ${DIM}────────────────────────────────────────${RESET}"
-  echo ""
-  echo -e "  ${BOLD}${WHITE}$1${RESET}"
-  echo ""
-}
+COL_NORMAL   = 0
+COL_BLUE     = 1
+COL_GREEN    = 2
+COL_YELLOW   = 3
+COL_RED      = 4
+COL_CYAN     = 5
+COL_GREY     = 6
+COL_WHITE    = 7
+COL_DIM_BLUE = 8
 
-# Green tick for success
-ok() {
-  echo -e "  ${GREEN}✓${RESET}  $1"
-}
-
-# Blue info line
-info() {
-  echo -e "  ${BLUE}→${RESET}  $1"
-}
-
-# Yellow warning
-warn() {
-  echo -e "  ${YELLOW}!${RESET}  $1"
-}
-
-# Red error, then exit
-die() {
-  echo ""
-  echo -e "  ${RED}✗  Something went wrong.${RESET}"
-  echo -e "  ${RED}   $1${RESET}"
-  echo ""
-  echo -e "  ${DIM}The installer has stopped. Nothing on your disk has been changed yet${RESET}"
-  echo -e "  ${DIM}(unless partitioning had already started).${RESET}"
-  echo ""
-  exit 1
-}
-
-# Spinner for long running tasks
-spinner() {
-  local pid=$1
-  local label=$2
-  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-  local i=0
-  while kill -0 "$pid" 2>/dev/null; do
-    printf "\r  ${BLUE}${frames[$i]}${RESET}  ${label}..."
-    i=$(((i + 1) % ${#frames[@]}))
-    sleep 0.08
-  done
-  printf "\r  ${GREEN}✓${RESET}  ${label}   \n"
-}
-
-# Simple progress bar (step N of TOTAL)
-progress() {
-  local step=$1
-  local total=$2
-  local label=$3
-  local filled=$((step * 30 / total))
-  local empty=$((30 - filled))
-  local bar=""
-  for ((i = 0; i < filled; i++)); do bar+="█"; done
-  for ((i = 0; i < empty; i++)); do bar+="░"; done
-  echo -e "  ${DIM}[${bar}]  ${step}/${total}  ${label}${RESET}"
-}
-
-# Ask a question, store result in REPLY
-ask() {
-  echo -ne "  ${CYAN}?${RESET}  ${BOLD}$1${RESET}  ${DIM}$2${RESET}\n  ${GREY}›${RESET} "
-  read -r REPLY
-}
-
-# Ask a secret (password), store in REPLY
-ask_secret() {
-  echo -ne "  ${CYAN}?${RESET}  ${BOLD}$1${RESET}\n  ${GREY}›${RESET} "
-  read -rs REPLY
-  echo ""
-}
-
-# Yes/no confirmation — returns 0 for yes, 1 for no
-confirm() {
-  echo -ne "  ${YELLOW}?${RESET}  ${BOLD}$1${RESET}  ${DIM}[y/N]${RESET}  "
-  read -r yn
-  [[ "$yn" =~ ^[Yy]$ ]]
-}
 
 # ============================================================
-# WELCOME SCREEN
+# INSTALL CONFIGURATION  (plain data, no logic)
 # ============================================================
 
-clear
-echo ""
-echo ""
-echo -e "  ${BLUE}${BOLD}"
-echo "       _     _       _     _    _             _     "
-echo "      | |   (_)     | |   | |  / \           | |    "
-echo "      | |    _  __ _| |__ | |_/ _ \_ __ ___| |__  "
-echo "      | |   | |/ _\` | '_ \| __/ ___ \ '__/ __| '_ \ "
-echo "      | |___| | (_| | | | | |_/ / \ \ | | (__| | | |"
-echo "      |_____|_|\__, |_| |_|\__\/   \/_|  \___|_| |_|"
-echo "                __/ |                               "
-echo "               |___/                        0.11    "
-echo -e "${RESET}"
-echo ""
-echo -e "  ${WHITE}${BOLD}Welcome to LightArch.${RESET}"
-echo ""
-echo -e "  ${DIM}This installer will guide you through setting up your system."
-echo -e "  It takes about 10–15 minutes depending on your connection."
-echo -e "  Your disk will be wiped. Everything else is handled for you.${RESET}"
-echo ""
-echo -e "  ${DIM}Requirements:  UEFI firmware  ·  Internet connection  ·  No NVIDIA${RESET}"
-echo ""
-echo -ne "  Press ${BOLD}Enter${RESET} to begin, or ${BOLD}Ctrl+C${RESET} to exit.  "
-read -r
+@dataclass
+class InstallConfig:
+    # User-supplied
+    disk:           str = ""
+    username:       str = ""
+    hostname:       str = ""
+    timezone:       str = ""
+    locale:         str = "en_US.UTF-8"
+    keymap:         str = "us"
+    _password_plain: str = field(default="", repr=False)
+
+    # Detected / derived
+    disk_size_gb:   int = 0
+    swap_mb:        int = 2048
+    efi_part:       str = ""
+    swap_part:      str = ""
+    root_part:      str = ""
+    ucode_pkg:      str = ""
+    is_uefi:        bool = True      # detected at preflight
+    is_nvme:        bool = False     # affects partition naming
+
+    def wipe_password(self):
+        """Overwrite the plaintext password and delete the attribute."""
+        self._password_plain = "\x00" * max(len(self._password_plain), 64)
+        self._password_plain = ""
+
+
+# ============================================================
+# SHELL HELPERS
+# ============================================================
+
+class CommandError(Exception):
+    """Raised when a required command fails."""
+
+
+def _env() -> dict:
+    """Return a clean, minimal environment for subprocesses."""
+    keep = {
+        "PATH", "HOME", "TERM", "LANG", "LC_ALL",
+        "PACMAN_AUTH", "DBUS_SESSION_BUS_ADDRESS",
+    }
+    return {k: v for k, v in os.environ.items() if k in keep}
+
+
+def run(
+    cmd,
+    *,
+    check: bool = True,
+    capture: bool = False,
+    input_text: Optional[str] = None,
+    env: Optional[dict] = None,
+) -> subprocess.CompletedProcess:
+    """
+    Run a command.
+    - cmd: str (shell=True) or list (shell=False, preferred).
+    - Raises CommandError (not CalledProcessError) so callers can catch cleanly.
+    """
+    combined_env = {**_env(), **(env or {})}
+    kwargs: dict = dict(
+        shell=isinstance(cmd, str),
+        env=combined_env,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
+    )
+    if input_text is not None:
+        kwargs["input"] = input_text.encode()
+        kwargs["stdin"] = subprocess.PIPE
+    try:
+        result = subprocess.run(cmd, **kwargs)
+    except FileNotFoundError as exc:
+        if check:
+            raise CommandError(f"Command not found: {cmd!r}") from exc
+        return subprocess.CompletedProcess(cmd, 127, b"", b"")
+    except OSError as exc:
+        if check:
+            raise CommandError(f"OS error running {cmd!r}: {exc}") from exc
+        return subprocess.CompletedProcess(cmd, 1, b"", b"")
+
+    if check and result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise CommandError(
+            f"Command {cmd!r} failed (exit {result.returncode})"
+            + (f": {stderr}" if stderr else "")
+        )
+    return result
+
+
+def run_output(cmd) -> str:
+    """Run a command, return stripped stdout. Empty string on any failure."""
+    try:
+        r = run(cmd, check=False, capture=True)
+        return (r.stdout or b"").decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def cmd_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def run_stream(cmd: list, log_path: str, env: Optional[dict] = None) -> tuple[int, list[str]]:
+    """
+    Run *cmd* (must be a list), stream stdout+stderr to *log_path*,
+    and return (returncode, list_of_stripped_lines).
+
+    Never hangs on interactive prompts — always pass --noconfirm to pacman/pacstrap.
+    stdin is /dev/null so nothing can block waiting for input.
+    """
+    combined_env = {**_env(), **(env or {})}
+    lines: list[str] = []
+
+    try:
+        with open(log_path, "w", buffering=1) as log_f:
+            with open(os.devnull, "r") as devnull:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=devnull,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=combined_env,
+                    text=True,
+                    bufsize=1,
+                )
+            for line in proc.stdout:
+                log_f.write(line)
+                lines.append(line.rstrip())
+            proc.wait()
+        return proc.returncode, lines
+
+    except FileNotFoundError as exc:
+        return 127, [str(exc)]
+    except Exception as exc:
+        return 1, [str(exc)]
+
+
+def arch_chroot(
+    cmd: list[str],
+    *,
+    input_text: Optional[str] = None,
+    log_path: str = "/tmp/lightarch-chroot.log",
+    env: Optional[dict] = None,
+) -> tuple[int, list[str]]:
+    """
+    Run a command inside /mnt via arch-chroot.
+    Streams output to *log_path*, returns (returncode, lines).
+    If *input_text* is given, it is sent to stdin (then stdin is closed).
+    """
+    combined_env = {**_env(), **(env or {})}
+    lines: list[str] = []
+
+    full_cmd = ["arch-chroot", "/mnt"] + cmd
+
+    try:
+        with open(log_path, "a", buffering=1) as log_f:
+            proc = subprocess.Popen(
+                full_cmd,
+                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=combined_env,
+                text=True,
+                bufsize=1,
+            )
+            if input_text is not None:
+                proc.stdin.write(input_text)
+                proc.stdin.close()
+
+            for line in proc.stdout:
+                log_f.write(line)
+                lines.append(line.rstrip())
+            proc.wait()
+
+        return proc.returncode, lines
+
+    except FileNotFoundError:
+        return 127, ["arch-chroot not found — boot from a current Arch Linux ISO."]
+    except Exception as exc:
+        return 1, [str(exc)]
+
+
+# ============================================================
+# TUI ENGINE
+# ============================================================
+
+class TUI:
+    """
+    Minimal, robust terminal UI.
+
+    Design constraints:
+      - Never crash on a small terminal — truncate silently.
+      - Never leave the terminal in a broken state.
+      - Log every message so a post-mortem is possible.
+    """
+
+    SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, stdscr):
+        self.scr = stdscr
+        self._log: list[str] = []
+        self._row = 0
+        self._init_colours()
+        self.scr.keypad(True)
+        self.scr.scrollok(True)
+        curses.curs_set(1)
+
+    # ── Colour init ───────────────────────────────────────
+
+    def _init_colours(self):
+        curses.use_default_colors()
+        if curses.COLORS >= 256:
+            pairs = [
+                (COL_BLUE,     75,  -1),
+                (COL_GREEN,   114,  -1),
+                (COL_YELLOW,  221,  -1),
+                (COL_RED,     203,  -1),
+                (COL_CYAN,    123,  -1),
+                (COL_GREY,    245,  -1),
+                (COL_WHITE,   231,  -1),
+                (COL_DIM_BLUE, 75,  -1),
+            ]
+        else:
+            pairs = [
+                (COL_BLUE,    curses.COLOR_BLUE,   -1),
+                (COL_GREEN,   curses.COLOR_GREEN,  -1),
+                (COL_YELLOW,  curses.COLOR_YELLOW, -1),
+                (COL_RED,     curses.COLOR_RED,    -1),
+                (COL_CYAN,    curses.COLOR_CYAN,   -1),
+                (COL_GREY,    curses.COLOR_WHITE,  -1),
+                (COL_WHITE,   curses.COLOR_WHITE,  -1),
+                (COL_DIM_BLUE,curses.COLOR_BLUE,   -1),
+            ]
+        for pair_id, fg, bg in pairs:
+            curses.init_pair(pair_id, fg, bg)
+
+    # ── Low-level rendering ───────────────────────────────
+
+    def _dims(self) -> tuple[int, int]:
+        return self.scr.getmaxyx()
+
+    def _write(
+        self,
+        row: int,
+        col: int,
+        text: str,
+        colour: int = COL_NORMAL,
+        *,
+        bold: bool = False,
+        dim: bool = False,
+    ):
+        h, w = self._dims()
+        if row < 0 or row >= h or col < 0 or col >= w:
+            return
+        text = text[: max(0, w - col - 1)]
+        if not text:
+            return
+        attr = curses.color_pair(colour)
+        if bold:
+            attr |= curses.A_BOLD
+        if dim:
+            attr |= curses.A_DIM
+        try:
+            self.scr.addstr(row, col, text, attr)
+        except curses.error:
+            pass
+
+    def _advance(self) -> int:
+        """Move to the next row, scrolling if necessary."""
+        h, _ = self._dims()
+        self._row += 1
+        if self._row >= h - 1:
+            self.scr.scroll(1)
+            self._row = h - 2
+        return self._row
+
+    def _blank(self) -> int:
+        r = self._advance()
+        _, w = self._dims()
+        self._write(r, 0, " " * max(0, w - 1))
+        return r
+
+    def _flush(self):
+        try:
+            self.scr.refresh()
+        except curses.error:
+            pass
+
+    # ── Stage header ──────────────────────────────────────
+
+    def stage(self, title: str):
+        """Clear screen and draw a new stage header."""
+        self.scr.clear()
+        self._row = 0
+        self._blank()
+        self._blank()
+        r = self._advance()
+        self._write(r, 2, f"LightArch {VERSION}", COL_BLUE, bold=True)
+        self._write(r, 2 + len(f"LightArch {VERSION}") + 2, "—  Installer", COL_GREY, dim=True)
+        r = self._advance()
+        self._write(r, 2, "─" * 48, COL_GREY, dim=True)
+        self._blank()
+        r = self._advance()
+        self._write(r, 2, title, COL_WHITE, bold=True)
+        self._blank()
+        self._flush()
+
+    # ── Status lines ──────────────────────────────────────
+
+    def ok(self, msg: str):
+        r = self._advance()
+        self._write(r, 2, "✓", COL_GREEN, bold=True)
+        self._write(r, 4, f"  {msg}")
+        self._log.append(f"OK   {msg}")
+        self._flush()
+
+    def info(self, msg: str):
+        r = self._advance()
+        self._write(r, 2, "→", COL_BLUE)
+        self._write(r, 4, f"  {msg}")
+        self._log.append(f"INFO {msg}")
+        self._flush()
+
+    def warn(self, msg: str):
+        r = self._advance()
+        self._write(r, 2, "!", COL_YELLOW, bold=True)
+        self._write(r, 4, f"  {msg}")
+        self._log.append(f"WARN {msg}")
+        self._flush()
+
+    def print(self, text: str = "", colour: int = COL_GREY, *, dim: bool = False, indent: int = 2):
+        for line in (text.splitlines() or [""]):
+            r = self._advance()
+            self._write(r, indent, line, colour, dim=dim)
+        self._flush()
+
+    def blank(self):
+        self._blank()
+        self._flush()
+
+    # ── Fatal error ───────────────────────────────────────
+
+    def die(self, msg: str) -> None:
+        """Display a fatal error and block until the user presses a key, then exit."""
+        self._log.append(f"FATAL {msg}")
+        self.blank()
+        r = self._advance()
+        self._write(r, 2, "✗  Fatal error", COL_RED, bold=True)
+        self.blank()
+        # Word-wrap the message at 70 chars.
+        words = msg.split()
+        lines_out: list[str] = []
+        current = ""
+        for w in words:
+            if len(current) + len(w) + 1 > 70 and current:
+                lines_out.append(current)
+                current = w
+            else:
+                current = (current + " " + w).lstrip()
+        if current:
+            lines_out.append(current)
+        for line in lines_out:
+            r = self._advance()
+            self._write(r, 4, line, COL_RED)
+        self.blank()
+        r = self._advance()
+        self._write(r, 2, "The installer has stopped. Your disk is safe if partitioning", COL_GREY, dim=True)
+        r = self._advance()
+        self._write(r, 2, "had not yet started.", COL_GREY, dim=True)
+        self.blank()
+        r = self._advance()
+        self._write(r, 2, "Check /tmp/lightarch-install.log for more details.", COL_GREY, dim=True)
+        self.blank()
+        r = self._advance()
+        self._write(r, 2, "Press any key to exit.", COL_GREY, dim=True)
+        self._flush()
+        curses.curs_set(0)
+        self.scr.getch()
+        raise SystemExit(1)
+
+    # ── Progress bar ──────────────────────────────────────
+
+    def progress(self, step: int, total: int, label: str):
+        filled = step * 32 // total
+        bar = "█" * filled + "░" * (32 - filled)
+        r = self._advance()
+        pct = step * 100 // total
+        self._write(r, 2, f"[{bar}] {pct:3d}%  {label}", COL_GREY, dim=True)
+        self._flush()
+
+    # ── Spinner ───────────────────────────────────────────
+
+    def spinner(self, label: str, func, *args, **kwargs):
+        """
+        Run *func* in a background thread while animating a spinner.
+        Propagates any exception raised by *func*.
+        """
+        result_box: list = [None]
+        exc_box:    list = [None]
+
+        def _worker():
+            try:
+                result_box[0] = func(*args, **kwargs)
+            except Exception as exc:
+                exc_box[0] = exc
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+
+        r = self._advance()
+        i = 0
+        _, w = self._dims()
+        while t.is_alive():
+            frame = self.SPINNER_FRAMES[i % len(self.SPINNER_FRAMES)]
+            line  = f"  {frame}  {label}..."
+            self._write(r, 0, line.ljust(min(w - 1, 80)), COL_BLUE)
+            self._flush()
+            i += 1
+            time.sleep(0.08)
+
+        t.join()
+        self._write(r, 0, f"  ✓  {label}".ljust(min(w - 1, 80)), COL_GREEN)
+        self._flush()
+
+        if exc_box[0]:
+            raise exc_box[0]
+        return result_box[0]
+
+    # ── Input helpers ─────────────────────────────────────
+
+    def _input_row(self, question: str, hint: str = "", colour: int = COL_CYAN) -> int:
+        """Draw a question prompt, return the row number of the input field."""
+        self.blank()
+        r = self._advance()
+        self._write(r, 2, "?", colour, bold=True)
+        self._write(r, 4, f"  {question}", COL_WHITE, bold=True)
+        if hint:
+            self._write(r, 4 + 2 + len(question) + 2, hint, COL_GREY, dim=True)
+        r = self._advance()
+        self._write(r, 2, "›", COL_GREY)
+        self._flush()
+        return r
+
+    def ask(self, question: str, hint: str = "", *, default: str = "") -> str:
+        """
+        Prompt for a line of text. Returns stripped input.
+        If the user hits Enter with no input and *default* is set, returns *default*.
+        """
+        full_hint = hint
+        if default and not hint:
+            full_hint = f"[default: {default}]"
+        elif default and hint:
+            full_hint = f"{hint}  [default: {default}]"
+
+        r = self._input_row(question, full_hint)
+        self.scr.move(r, 4)
+        _, w = self._dims()
+        curses.echo()
+        curses.curs_set(1)
+        try:
+            raw = self.scr.getstr(r, 4, w - 6).decode("utf-8", errors="replace").strip()
+        finally:
+            curses.noecho()
+            curses.curs_set(1)
+        return raw if raw else default
+
+    def ask_secret(self, question: str) -> str:
+        """Prompt for a password. Input is masked with asterisks."""
+        r = self._input_row(question, "", colour=COL_CYAN)
+        self.scr.move(r, 4)
+        curses.noecho()
+        curses.curs_set(1)
+        chars: list[str] = []
+        _, w = self._dims()
+        while True:
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            if ch in ("\n", "\r", curses.KEY_ENTER):
+                break
+            elif ch in ("\x7f", "\x08", curses.KEY_BACKSPACE):
+                if chars:
+                    chars.pop()
+                    cy, cx = self.scr.getyx()
+                    self.scr.move(cy, max(4, cx - 1))
+                    self.scr.clrtoeol()
+            elif isinstance(ch, str) and ch.isprintable():
+                if len(chars) < w - 6:
+                    chars.append(ch)
+                    self.scr.addstr("*")
+            self._flush()
+        self.blank()
+        return "".join(chars)
+
+    def confirm(self, question: str, *, default_yes: bool = False) -> bool:
+        """Ask a yes/no question. Returns True for yes."""
+        yn = "[Y/n]" if default_yes else "[y/N]"
+        r = self._input_row(question, yn, colour=COL_YELLOW)
+        curses.echo()
+        curses.curs_set(1)
+        _, w = self._dims()
+        try:
+            raw = self.scr.getstr(r, 4, 4).decode("utf-8", errors="replace").strip().lower()
+        finally:
+            curses.noecho()
+        if not raw:
+            return default_yes
+        return raw.startswith("y")
+
+    def menu(self, title: str, options: list[tuple[str, str]]) -> int:
+        """
+        Display a numbered menu. Returns the zero-based index of the chosen option.
+        Validates input and loops until a valid choice is made.
+        """
+        if title:
+            self.blank()
+            r = self._advance()
+            self._write(r, 2, title, COL_GREY, dim=True)
+        self.blank()
+        for i, (label, desc) in enumerate(options, start=1):
+            r = self._advance()
+            self._write(r, 4, f"{i})", COL_WHITE, bold=True)
+            self._write(r, 7, label, COL_WHITE)
+            if desc:
+                self._write(r, 7 + len(label) + 2, desc, COL_GREY, dim=True)
+        self.blank()
+        n = len(options)
+        while True:
+            raw = self.ask("Choice", f"[1–{n}]", default="1")
+            if raw.isdigit() and 1 <= int(raw) <= n:
+                return int(raw) - 1
+            self.warn(f"Enter a number between 1 and {n}.")
+
+    # ── Log persistence ───────────────────────────────────
+
+    def save_log(self, path: str = "/tmp/lightarch-install.log"):
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                f.write("\n".join(self._log) + "\n")
+        except Exception:
+            pass
+
 
 # ============================================================
 # PREFLIGHT CHECKS
 # ============================================================
 
-stage "Checking your system"
+def check_preflight(ui: TUI, cfg: InstallConfig):
+    ui.stage("Checking your system")
 
-info "Checking UEFI..."
-if [[ ! -d /sys/firmware/efi ]]; then
-  die "This system doesn't appear to be booted in UEFI mode. LightArch requires UEFI."
-fi
-ok "UEFI confirmed"
+    # Root
+    ui.info("Checking privileges...")
+    if os.geteuid() != 0:
+        ui.die("Must be run as root. Try: sudo python3 install.py")
+    ui.ok("Running as root")
 
-info "Checking for NVIDIA GPU..."
-if lspci 2>/dev/null | grep -qi nvidia; then
-  echo ""
-  warn "An NVIDIA GPU was detected."
-  echo ""
-  echo -e "  ${DIM}LightArch doesn't support NVIDIA out of the box."
-  echo -e "  You can continue, but you may experience issues with Hyprland."
-  echo -e "  Check the Arch wiki for NVIDIA Wayland setup after install.${RESET}"
-  echo ""
-  confirm "Continue anyway?" || {
-    echo "  Exiting. Sensible."
-    exit 0
-  }
-fi
-ok "GPU check done"
+    # Boot mode
+    ui.info("Detecting firmware mode...")
+    cfg.is_uefi = Path("/sys/firmware/efi").is_dir()
+    if cfg.is_uefi:
+        ui.ok("UEFI firmware detected")
+    else:
+        ui.ok("BIOS/CSM firmware detected (GRUB MBR mode)")
+
+    # Required tools
+    ui.info("Checking required tools...")
+    required_all = [
+        "sgdisk", "mkfs.fat", "mkswap", "mkfs.btrfs",
+        "pacstrap", "arch-chroot", "genfstab",
+        "btrfs", "lsblk", "free", "blockdev",
+    ]
+    required_uefi = ["efibootmgr"] if cfg.is_uefi else []
+    required_bios = ["grub-install"] if not cfg.is_uefi else []
+    optional_nice = ["reflector", "curl", "fzf"]
+
+    missing_hard = [
+        t for t in required_all + required_uefi + required_bios
+        if not cmd_exists(t)
+    ]
+    if missing_hard:
+        for t in missing_hard:
+            ui.warn(f"Missing: {t}")
+        ui.die("Missing required tools. Boot from a current Arch Linux ISO.")
+    ui.ok("All required tools present")
+
+    missing_soft = [t for t in optional_nice if not cmd_exists(t)]
+    for t in missing_soft:
+        ui.warn(f"Optional tool not found: {t} (some features may be limited)")
+
+    # Python version
+    ui.info("Checking Python version...")
+    if sys.version_info < (3, 10):
+        ui.die(f"Python 3.10+ required, got {sys.version}. Boot from a current Arch ISO.")
+    ui.ok(f"Python {sys.version_info.major}.{sys.version_info.minor}")
+
+    # GPU warning (non-blocking)
+    ui.info("Checking GPU...")
+    if cmd_exists("lspci"):
+        lspci_out = run_output("lspci")
+        if "nvidia" in lspci_out.lower():
+            ui.blank()
+            ui.warn("NVIDIA GPU detected.")
+            ui.print("Hyprland on NVIDIA works, but needs post-install driver setup.", dim=True)
+            ui.print("Consult: https://wiki.archlinux.org/title/NVIDIA#Wayland", dim=True)
+            ui.blank()
+            if not ui.confirm("Continue anyway?"):
+                ui.print("Exiting. Sensible.")
+                raise SystemExit(0)
+    ui.ok("GPU check done")
+
+    # Disks present
+    ui.info("Checking for block devices...")
+    raw = run_output("lsblk -d -o NAME")
+    real_disks = [
+        l for l in raw.splitlines()
+        if l and l != "NAME" and not l.startswith("loop")
+    ]
+    if not real_disks:
+        ui.die("No block devices found. Something is very wrong.")
+    ui.ok(f"Found {len(real_disks)} disk(s)")
+
+    # Keyring
+    ui.info("Checking pacman keyring...")
+    keyring_ok = "Arch Linux" in run_output("pacman-key --list-keys 2>/dev/null")
+    if not keyring_ok:
+        ui.warn("Keyring may not be initialised — attempting to fix...")
+        run(["pacman-key", "--init"],             check=False)
+        run(["pacman-key", "--populate", "archlinux"], check=False)
+    ui.ok("Pacman keyring OK")
+
+    # Memory
+    ui.info("Checking RAM...")
+    mem_raw = run_output("free -m")
+    mem_mb = 2048
+    for line in mem_raw.splitlines():
+        if line.startswith("Mem:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                mem_mb = int(parts[1])
+                break
+    if mem_mb < 512:
+        ui.warn(f"Only {mem_mb} MB RAM detected — installation may be slow or fail.")
+    else:
+        ui.ok(f"{mem_mb} MB RAM")
+    cfg.swap_mb = min(mem_mb, 8192)
+
 
 # ============================================================
 # NETWORK
 # ============================================================
 
-stage "Connecting to the internet"
+def _ping_ok() -> bool:
+    return run(["ping", "-c", "1", "-W", "3", "archlinux.org"], check=False).returncode == 0
 
-if ping -c 1 archlinux.org &>/dev/null 2>&1; then
-  ok "Already connected"
-else
-  echo -e "  ${DIM}No connection detected. Let's get you online.${RESET}"
-  echo ""
 
-  info "Scanning for networks..."
-  iwctl station wlan0 scan &>/dev/null
-  sleep 2
+def check_network(ui: TUI):
+    ui.stage("Network")
 
-  echo ""
-  echo -e "  ${DIM}Networks found:${RESET}"
-  echo ""
-  iwctl station wlan0 get-networks 2>/dev/null | tail -n +5 | head -20 | while read -r line; do
-    echo "     $line"
-  done
-  echo ""
+    ui.info("Testing connectivity...")
+    connected = False
+    for attempt in range(1, 6):
+        if _ping_ok():
+            connected = True
+            break
+        if attempt < 5:
+            ui.info(f"No reply — retrying ({attempt}/5)...")
+            time.sleep(3)
 
-  ask "Network name (exactly as shown above)" ""
-  SSID="$REPLY"
+    if connected:
+        ui.ok("Internet reachable")
+    else:
+        ui.blank()
+        ui.print("No internet connection detected. Let's fix that.", dim=True)
+        ui.blank()
 
-  ask_secret "Password"
-  WIFI_PASS="$REPLY"
+        if not cmd_exists("iwctl"):
+            ui.die(
+                "No internet and iwctl is not available. "
+                "Plug in ethernet and restart the installer."
+            )
 
-  info "Connecting to ${SSID}..."
-  iwctl --passphrase "$WIFI_PASS" station wlan0 connect "$SSID" 2>/dev/null
-  sleep 3
+        # Find wireless interface
+        wlan_if = ""
+        for line in run_output("iw dev").splitlines():
+            if "Interface" in line:
+                wlan_if = line.split()[-1].strip()
+                break
 
-  if ping -c 1 archlinux.org &>/dev/null 2>&1; then
-    ok "Connected to ${SSID}"
-  else
-    die "Couldn't connect to '${SSID}'. Check the name and password and run the installer again."
-  fi
-fi
+        if not wlan_if:
+            ui.die("No wireless interface found and ethernet appears to be down.")
 
-echo ""
-info "Finding the fastest mirrors. This takes a moment..."
-reflector --latest 10 --sort rate --save /etc/pacman.d/mirrorlist &>/dev/null &
-spinner $! "Optimising mirrors"
+        ui.info(f"Scanning on {wlan_if}...")
+        run(["iwctl", "station", wlan_if, "scan"], check=False)
+        time.sleep(2)
+
+        ui.blank()
+        ui.print("Nearby networks:", dim=True)
+        nets = run_output(f"iwctl station {wlan_if} get-networks")
+        for line in nets.splitlines()[2:22]:  # skip header lines
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if clean:
+                ui.print(f"  {clean}", indent=4)
+        ui.blank()
+
+        ssid = ui.ask("Network SSID", "(exactly as shown above)")
+        if not ssid:
+            ui.die("No SSID entered.")
+
+        # Use a temp file for the passphrase — never in an env var or argv.
+        fd, tmp_pass = tempfile.mkstemp(prefix="lightarch-wpa.")
+        os.chmod(tmp_pass, 0o600)
+        passwd = ""
+        try:
+            passwd = ui.ask_secret("Wi-Fi password")
+            with os.fdopen(fd, "w") as fh:
+                fh.write(passwd)
+            fd = None
+
+            passphrase = Path(tmp_pass).read_text().strip()
+            run(
+                ["iwctl", "--passphrase", passphrase, "station", wlan_if, "connect", ssid],
+                check=False,
+            )
+            passphrase = ""
+        finally:
+            passwd = ""
+            if fd is not None:
+                os.close(fd)
+            # Overwrite before unlinking.
+            try:
+                with open(tmp_pass, "wb") as fh:
+                    fh.write(b"\x00" * 256)
+                os.unlink(tmp_pass)
+            except Exception:
+                pass
+
+        time.sleep(4)
+        if not _ping_ok():
+            ui.die(f"Still no internet after connecting to '{ssid}'. Check credentials.")
+        ui.ok(f"Connected to {ssid}")
+
+    # Optimise mirrors
+    if cmd_exists("reflector"):
+        def _reflector():
+            run(
+                ["reflector", "--latest", "10", "--sort", "rate",
+                 "--save", "/etc/pacman.d/mirrorlist"],
+                check=False,
+            )
+        ui.spinner("Optimising mirrors with reflector", _reflector)
+    else:
+        ui.warn("reflector not found — using default mirrorlist")
+
 
 # ============================================================
 # DISK SELECTION
 # ============================================================
 
-stage "Choose your disk"
+def _get_disk_info() -> list[dict]:
+    """
+    Return a list of dicts with keys: name, size_bytes, size_human, model.
+    Excludes loop devices and ram disks.
+    """
+    raw = run_output("lsblk -d -b -o NAME,SIZE,MODEL --json")
+    disks: list[dict] = []
 
-echo -e "  ${DIM}These are the disks available on your system.${RESET}"
-echo -e "  ${DIM}The one you choose will be completely wiped.${RESET}"
-echo ""
+    # Try JSON first (lsblk >= 2.27)
+    if raw.startswith("{"):
+        import json
+        try:
+            data = json.loads(raw)
+            for dev in data.get("blockdevices", []):
+                name = dev.get("name", "")
+                if name.startswith("loop") or name.startswith("ram"):
+                    continue
+                size_b = int(dev.get("size", 0) or 0)
+                disks.append({
+                    "name":        name,
+                    "size_bytes":  size_b,
+                    "size_human":  f"{size_b // (1024**3)} GB",
+                    "model":       (dev.get("model") or "").strip(),
+                })
+            return disks
+        except Exception:
+            pass
 
-# Pretty disk list
-echo -e "  ${BOLD}  NAME          SIZE    MODEL${RESET}"
-echo -e "  ${DIM}  ──────────────────────────────────────────${RESET}"
-while IFS= read -r line; do
-  echo "     $line"
-done < <(lsblk -d -o NAME,SIZE,MODEL | grep -v loop | grep -v NAME)
-echo ""
+    # Fallback: plain text
+    for line in run_output("lsblk -d -o NAME,SIZE,MODEL").splitlines():
+        if line.startswith("NAME") or line.startswith("loop") or line.startswith("ram"):
+            continue
+        parts = line.split(None, 2)
+        if not parts:
+            continue
+        name = parts[0].strip()
+        size_h = parts[1].strip() if len(parts) > 1 else "?"
+        model  = parts[2].strip() if len(parts) > 2 else ""
+        # Get size in bytes separately
+        size_raw = run_output(f"lsblk -bdno SIZE /dev/{name}")
+        size_b   = int(size_raw) if size_raw.isdigit() else 0
+        disks.append({
+            "name":       name,
+            "size_bytes": size_b,
+            "size_human": size_h,
+            "model":      model,
+        })
+    return disks
 
-ask "Which disk? (e.g. sda, nvme0n1)" ""
-DISK_INPUT="$REPLY"
-DISK="/dev/${DISK_INPUT}"
 
-[[ -b "$DISK" ]] || die "Disk '${DISK}' not found. Double-check the name and try again."
+def select_disk(ui: TUI, cfg: InstallConfig):
+    ui.stage("Choose your disk")
 
-DISK_SIZE_BYTES=$(lsblk -bno SIZE "$DISK" | head -1)
-DISK_SIZE_GB=$((DISK_SIZE_BYTES / 1024 / 1024 / 1024))
-SWAP_MB=$((DISK_SIZE_BYTES / 1024 / 1024 / 10))
-SWAP_SIZE="${SWAP_MB}M"
+    disks = _get_disk_info()
+    if not disks:
+        ui.die("No disks found by lsblk. Something is very wrong.")
 
-echo ""
-ok "Selected: ${BOLD}${DISK}${RESET}  (${DISK_SIZE_GB} GB)"
-echo ""
-echo -e "  ${DIM}Partition layout:${RESET}"
-echo -e "  ${DIM}  512 MB   →  EFI boot partition${RESET}"
-echo -e "  ${DIM}  ${SWAP_MB} MB   →  Swap (10% of disk)${RESET}"
-echo -e "  ${DIM}  Rest     →  System (btrfs, compressed)${RESET}"
+    ui.print("Disks detected on this system:", dim=True)
+    ui.print("The disk you choose will be completely and irreversibly erased.", dim=True)
+    ui.blank()
+
+    r = ui._advance()
+    ui._write(r, 4, f"{'NAME':<12} {'SIZE':<10} MODEL", COL_WHITE, bold=True)
+    r = ui._advance()
+    ui._write(r, 4, "─" * 48, COL_GREY, dim=True)
+    ui._flush()
+
+    for d in disks:
+        r = ui._advance()
+        ui._write(r, 4, f"{d['name']:<12} {d['size_human']:<10} {d['model']}", COL_NORMAL)
+    ui._flush()
+    ui.blank()
+
+    # Offer fzf-based selection if available
+    if cmd_exists("fzf"):
+        ui.info("Tip: type to fuzzy-search the disk name.")
+
+    min_gb = 10
+    while True:
+        raw_input = ui.ask("Which disk?", "(e.g. sda, nvme0n1, vda)")
+        disk_name = raw_input.strip().lstrip("/")
+        if disk_name.startswith("dev/"):
+            disk_name = disk_name[4:]
+
+        if not disk_name:
+            ui.warn("Please enter a disk name.")
+            continue
+
+        disk_path = Path(f"/dev/{disk_name}")
+        if not disk_path.is_block_device():
+            ui.warn(f"'{disk_path}' is not a block device. Check the name.")
+            continue
+
+        # Match against our disk list for size info
+        matched = next((d for d in disks if d["name"] == disk_name), None)
+        if matched:
+            size_bytes = matched["size_bytes"]
+        else:
+            raw_size = run_output(f"lsblk -bdno SIZE /dev/{disk_name}")
+            size_bytes = int(raw_size) if raw_size.isdigit() else 0
+
+        size_gb = size_bytes // (1024 ** 3)
+
+        if size_gb < min_gb:
+            ui.warn(f"{disk_path} is only {size_gb} GB. At least {min_gb} GB is required.")
+            continue
+
+        # Warn if this looks like the boot disk
+        boot_src = run_output("findmnt -n -o SOURCE /")
+        if boot_src:
+            boot_disk_name = run_output(f"lsblk -no PKNAME {boot_src}")
+            if boot_disk_name.strip() == disk_name:
+                ui.blank()
+                ui.warn("That appears to be the disk you booted from!")
+                if not ui.confirm("Are you absolutely sure you want to wipe it?"):
+                    ui.die("Aborting at your request. Wise choice.")
+
+        cfg.disk         = str(disk_path)
+        cfg.disk_size_gb = size_gb
+        cfg.is_nvme      = "nvme" in disk_name or "mmcblk" in disk_name
+        break
+
+    ui.blank()
+    ui.ok(f"Selected: {cfg.disk}  ({cfg.disk_size_gb} GB)")
+    ui.blank()
+    ui.print("Partition layout:", dim=True)
+    if cfg.is_uefi:
+        ui.print("  512 MB   →  FAT32 EFI partition", dim=True)
+    else:
+        ui.print("  1 MB     →  BIOS boot partition (GRUB MBR)", dim=True)
+    ui.print(f"  {cfg.swap_mb} MB  →  Swap (sized to RAM, max 8 GB)", dim=True)
+    ui.print("  Rest     →  btrfs root (zstd compressed, 5 subvolumes)", dim=True)
+
 
 # ============================================================
 # USER DETAILS
 # ============================================================
 
-stage "Set up your account"
+def collect_user_details(ui: TUI, cfg: InstallConfig):
+    ui.stage("Your account")
+    ui.print("This will be your primary user account.", dim=True)
+    ui.print("Root will share the same password.", dim=True)
+    ui.blank()
 
-echo -e "  ${DIM}This will be your main user account.${RESET}"
-echo ""
+    # Username
+    while True:
+        raw = ui.ask("Username", "(lowercase letters, numbers, hyphens, underscores)")
+        username = raw.lower().strip()
+        if re.fullmatch(r"[a-z][a-z0-9_-]{0,30}", username):
+            # Refuse reserved names
+            reserved = {"root", "daemon", "bin", "sys", "nobody", "halt", "shutdown"}
+            if username in reserved:
+                ui.warn(f"'{username}' is a reserved system account name.")
+                continue
+            cfg.username = username
+            break
+        ui.warn("Invalid username. Must start with a letter, max 31 chars.")
 
-ask "Your name" "(e.g. alice)"
-USERNAME="$REPLY"
-USERNAME="${USERNAME,,}" # lowercase
+    # Hostname
+    while True:
+        raw = ui.ask("Hostname", "(e.g. lightarch, mylaptop)")
+        hostname = raw.lower().strip()
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,61}[a-z0-9]?", hostname):
+            cfg.hostname = hostname
+            break
+        ui.warn("Invalid hostname. Lowercase letters, numbers, hyphens. Max 63 chars.")
 
-# Validate username
-if ! [[ "$USERNAME" =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; then
-  die "Username '${USERNAME}' isn't valid. Use lowercase letters, numbers, hyphens, underscores."
-fi
+    # Password
+    ui.blank()
+    ui.print("Password must be at least 8 characters.", dim=True)
+    ui.print("Colons are not permitted (they confuse chpasswd).", dim=True)
+    ui.blank()
 
-ask "Computer name" "(e.g. lightarch, mylaptop)"
-HOSTNAME="$REPLY"
-HOSTNAME="${HOSTNAME,,}"
+    while True:
+        p1 = ui.ask_secret("Password")
+        if len(p1) < 8:
+            ui.warn("Too short — at least 8 characters.")
+            p1 = ""
+            continue
+        if ":" in p1:
+            ui.warn("Colons are not allowed in the password.")
+            p1 = ""
+            continue
+        p2 = ui.ask_secret("Confirm password")
+        if p1 == p2:
+            cfg._password_plain = p1
+            del p1, p2
+            ui.ok("Password set")
+            break
+        ui.warn("Passwords don't match. Try again.")
+        del p1, p2
 
-if ! [[ "$HOSTNAME" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
-  die "Hostname '${HOSTNAME}' isn't valid."
-fi
 
-echo ""
-echo -e "  ${DIM}Choose a password for your account and root.${RESET}"
-echo ""
+# ============================================================
+# KEYBOARD
+# ============================================================
 
-while true; do
-  ask_secret "Password"
-  PASS1="$REPLY"
-  ask_secret "Confirm password"
-  PASS2="$REPLY"
-  if [[ "$PASS1" == "$PASS2" ]]; then
-    PASSWORD="$PASS1"
-    ok "Password set"
-    break
-  else
-    warn "Passwords don't match. Try again."
-    echo ""
-  fi
-done
+def select_keymap(ui: TUI, cfg: InstallConfig):
+    ui.stage("Keyboard layout")
+
+    common = [
+        ("us",         "US English (default)"),
+        ("uk",         "British"),
+        ("de-latin1",  "German"),
+        ("fr",         "French"),
+        ("es",         "Spanish"),
+        ("it",         "Italian"),
+        ("ru",         "Russian"),
+        ("colemak",    "Colemak"),
+        ("dvorak",     "Dvorak"),
+        ("Other",      ""),
+    ]
+
+    idx = ui.menu("Select a keyboard layout", [(label, desc) for label, desc in common])
+
+    if idx < len(common) - 1:
+        cfg.keymap = common[idx][0]
+    else:
+        # Manual entry
+        ui.blank()
+        if cmd_exists("fzf") and cmd_exists("localectl"):
+            ui.info("Launching fzf keymap picker...")
+            # Use a subshell so fzf can talk to the real terminal.
+            result = subprocess.run(
+                "localectl list-keymaps | fzf --height=20 --prompt='Keymap> '",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            chosen = result.stdout.strip()
+            if chosen:
+                cfg.keymap = chosen
+                ui.ok(f"Keymap set to {cfg.keymap}")
+                return
+            ui.warn("No keymap selected via fzf — falling back to manual entry.")
+
+        # Show a partial list
+        if cmd_exists("localectl"):
+            maps = run_output("localectl list-keymaps").splitlines()
+            ui.print(f"Available keymaps ({len(maps)} total, showing first 50):", dim=True)
+            for km in maps[:50]:
+                ui.print(f"  {km}", indent=4)
+            ui.blank()
+            all_maps = set(maps)
+        else:
+            all_maps = set()
+
+        while True:
+            km = ui.ask("Keymap name")
+            if not km:
+                ui.warn("No keymap entered — defaulting to 'us'.")
+                cfg.keymap = "us"
+                break
+            if not all_maps or km in all_maps:
+                cfg.keymap = km
+                break
+            ui.warn(f"'{km}' not found in localectl list-keymaps.")
+
+    ui.ok(f"Keymap: {cfg.keymap}")
+
 
 # ============================================================
 # TIMEZONE
 # ============================================================
 
-stage "Where are you?"
+def select_timezone(ui: TUI, cfg: InstallConfig):
+    ui.stage("Timezone")
 
-echo -e "  ${DIM}This sets your clock and timezone.${RESET}"
-echo ""
+    # Attempt IP-based detection
+    detected = ""
+    if cmd_exists("curl"):
+        raw = run_output("curl -s --max-time 5 https://ipapi.co/timezone")
+        if "/" in raw and Path(f"/usr/share/zoneinfo/{raw}").exists():
+            detected = raw.strip()
 
-# Try to auto-detect timezone
-DETECTED_TZ=""
-if command -v curl &>/dev/null; then
-  DETECTED_TZ=$(curl -s --max-time 3 https://ipapi.co/timezone 2>/dev/null || true)
-fi
+    if detected:
+        ui.ok(f"Detected timezone: {detected}")
+        if ui.confirm(f"Use {detected}?", default_yes=True):
+            cfg.timezone = detected
+            ui.ok(f"Timezone: {cfg.timezone}")
+            return
 
-if [[ -n "$DETECTED_TZ" && -f "/usr/share/zoneinfo/$DETECTED_TZ" ]]; then
-  ok "Detected timezone: ${BOLD}${DETECTED_TZ}${RESET}"
-  echo ""
-  if confirm "Use this timezone?"; then
-    TIMEZONE="$DETECTED_TZ"
-    ok "Timezone set to ${TIMEZONE}"
-  else
-    DETECTED_TZ=""
-  fi
-fi
+    # fzf picker
+    if cmd_exists("fzf"):
+        ui.info("Launching fzf timezone picker...")
+        result = subprocess.run(
+            "find /usr/share/zoneinfo -type f | "
+            "sed 's|/usr/share/zoneinfo/||' | "
+            "grep -v '^posix/' | grep -v '^right/' | "
+            "sort | fzf --height=20 --prompt='Timezone> '",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        chosen = result.stdout.strip()
+        if chosen and Path(f"/usr/share/zoneinfo/{chosen}").exists():
+            cfg.timezone = chosen
+            ui.ok(f"Timezone: {cfg.timezone}")
+            return
+        ui.warn("No timezone selected via fzf — falling back to manual entry.")
 
-if [[ -z "$DETECTED_TZ" ]]; then
-  echo -e "  ${DIM}Available regions:${RESET}"
-  echo ""
-  ls /usr/share/zoneinfo/ | grep -vE 'posix|right|\.tab|\.list|leap' | paste - - - - | while read -r line; do
-    echo "     $line"
-  done
-  echo ""
-  ask "Region" "(e.g. Europe, America, Asia)"
-  TZ_REGION="$REPLY"
+    # Manual two-step: region → city
+    zoneinfo = Path("/usr/share/zoneinfo")
+    regions = sorted(
+        d.name for d in zoneinfo.iterdir()
+        if d.is_dir() and d.name not in ("posix", "right", "Etc")
+    )
+    ui.blank()
+    ui.print("Available regions:", dim=True)
+    for reg in regions:
+        ui.print(f"  {reg}", indent=4)
+    ui.blank()
 
-  echo ""
-  echo -e "  ${DIM}Cities in ${TZ_REGION}:${RESET}"
-  echo ""
-  ls "/usr/share/zoneinfo/$TZ_REGION" 2>/dev/null | paste - - - - | while read -r line; do
-    echo "     $line"
-  done || die "Region '${TZ_REGION}' not found."
-  echo ""
+    while True:
+        region = ui.ask("Region", "(e.g. Europe, America, Asia)")
+        if (zoneinfo / region).is_dir():
+            break
+        ui.warn(f"'{region}' is not a valid region.")
 
-  ask "City" "(e.g. London, New_York, Singapore)"
-  TZ_CITY="$REPLY"
-  TIMEZONE="${TZ_REGION}/${TZ_CITY}"
+    cities = sorted(p.name for p in (zoneinfo / region).iterdir() if not p.is_dir())
+    ui.blank()
+    ui.print(f"Cities in {region}:", dim=True)
+    for city in cities:
+        ui.print(f"  {city}", indent=4)
+    ui.blank()
 
-  [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || {
-    warn "Timezone '${TIMEZONE}' not found. Defaulting to UTC."
-    TIMEZONE="UTC"
-  }
-  ok "Timezone set to ${TIMEZONE}"
-fi
+    while True:
+        city = ui.ask("City", "(e.g. London, New_York, Singapore)")
+        tz   = f"{region}/{city}"
+        if (zoneinfo / tz).exists():
+            cfg.timezone = tz
+            break
+        ui.warn(f"'{tz}' not found.")
+
+    ui.ok(f"Timezone: {cfg.timezone}")
+
 
 # ============================================================
 # LOCALE
 # ============================================================
 
-stage "Language and locale"
+def select_locale(ui: TUI, cfg: InstallConfig):
+    ui.stage("Language")
 
-echo -e "  ${DIM}Choose your system language.${RESET}"
-echo ""
-echo -e "     ${BOLD}1)${RESET}  English (US)     en_US.UTF-8"
-echo -e "     ${BOLD}2)${RESET}  English (UK)     en_GB.UTF-8"
-echo -e "     ${BOLD}3)${RESET}  German           de_DE.UTF-8"
-echo -e "     ${BOLD}4)${RESET}  French           fr_FR.UTF-8"
-echo -e "     ${BOLD}5)${RESET}  Japanese         ja_JP.UTF-8"
-echo -e "     ${BOLD}6)${RESET}  Chinese (S)      zh_CN.UTF-8"
-echo -e "     ${BOLD}7)${RESET}  Other"
-echo ""
+    options = [
+        ("en_US.UTF-8", "English (US)"),
+        ("en_GB.UTF-8", "English (UK)"),
+        ("de_DE.UTF-8", "German"),
+        ("fr_FR.UTF-8", "French"),
+        ("es_ES.UTF-8", "Spanish"),
+        ("it_IT.UTF-8", "Italian"),
+        ("ja_JP.UTF-8", "Japanese"),
+        ("zh_CN.UTF-8", "Chinese (Simplified)"),
+        ("pt_BR.UTF-8", "Portuguese (Brazil)"),
+        ("ru_RU.UTF-8", "Russian"),
+        ("Other",       ""),
+    ]
 
-ask "Choice" "[1–7, default 1]"
-case "$REPLY" in
-2) LOCALE="en_GB.UTF-8" ;;
-3) LOCALE="de_DE.UTF-8" ;;
-4) LOCALE="fr_FR.UTF-8" ;;
-5) LOCALE="ja_JP.UTF-8" ;;
-6) LOCALE="zh_CN.UTF-8" ;;
-7)
-  ask "Locale" "(e.g. en_AU.UTF-8)"
-  LOCALE="$REPLY"
-  ;;
-*) LOCALE="en_US.UTF-8" ;;
-esac
+    idx = ui.menu("Select your locale", [(desc, locale) for locale, desc in options])
 
-ok "Language set to ${LOCALE}"
+    if idx < len(options) - 1:
+        cfg.locale = options[idx][0]
+    else:
+        while True:
+            raw = ui.ask("Locale", "(e.g. en_AU.UTF-8)")
+            if re.fullmatch(r"[a-z]{2,3}_[A-Z]{2,3}\.UTF-8", raw):
+                cfg.locale = raw
+                # Warn if not in locale.gen
+                locale_gen = Path("/etc/locale.gen")
+                if locale_gen.exists() and cfg.locale not in locale_gen.read_text():
+                    ui.warn(f"'{cfg.locale}' not found in /etc/locale.gen — it may not generate.")
+                break
+            ui.warn("Expected format: ll_CC.UTF-8  (e.g. en_AU.UTF-8)")
+
+    ui.ok(f"Locale: {cfg.locale}")
+
 
 # ============================================================
 # REVIEW & CONFIRM
 # ============================================================
 
-stage "Ready to install"
+def review_and_confirm(ui: TUI, cfg: InstallConfig) -> bool:
+    ui.stage("Ready to install")
+    ui.blank()
 
-echo -e "  Here's what we're about to do:\n"
-echo -e "  ${GREY}──────────────────────────────────────────${RESET}"
-echo -e "  ${DIM}Disk${RESET}        ${BOLD}${DISK}${RESET}  (${DISK_SIZE_GB} GB — ${RED}will be wiped${RESET})"
-echo -e "  ${DIM}User${RESET}        ${BOLD}${USERNAME}${RESET}"
-echo -e "  ${DIM}Hostname${RESET}    ${BOLD}${HOSTNAME}${RESET}"
-echo -e "  ${DIM}Timezone${RESET}    ${BOLD}${TIMEZONE}${RESET}"
-echo -e "  ${DIM}Language${RESET}    ${BOLD}${LOCALE}${RESET}"
-echo -e "  ${GREY}──────────────────────────────────────────${RESET}"
-echo ""
-echo -e "  ${DIM}Filesystem:  btrfs with zstd compression, 5 subvolumes${RESET}"
-echo -e "  ${DIM}Desktop:     Hyprland (Wayland) + SDDM${RESET}"
-echo -e "  ${DIM}Audio:       PipeWire${RESET}"
-echo -e "  ${DIM}Shell:       zsh${RESET}"
-echo ""
-warn "This will permanently erase everything on ${DISK}."
-echo ""
+    r = ui._advance()
+    ui._write(r, 2, "─" * 48, COL_GREY, dim=True)
+    ui._flush()
 
-confirm "Start the installation?" || {
-  echo "  Exiting. Nothing was changed."
-  exit 0
-}
+    def _detail(label: str, value: str, extra_colour: int = COL_NORMAL):
+        r = ui._advance()
+        ui._write(r, 2,  f"{label:<12}", COL_GREY, dim=True)
+        ui._write(r, 15, value, COL_WHITE, bold=True)
+        if extra_colour != COL_NORMAL:
+            pass  # reserved for future use
+        ui._flush()
+
+    boot_mode = "UEFI" if cfg.is_uefi else "BIOS/MBR"
+    _detail("Disk",      f"{cfg.disk}  ({cfg.disk_size_gb} GB)  ← WILL BE ERASED")
+    _detail("Boot",      boot_mode)
+    _detail("User",      cfg.username)
+    _detail("Hostname",  cfg.hostname)
+    _detail("Timezone",  cfg.timezone)
+    _detail("Locale",    cfg.locale)
+    _detail("Keymap",    cfg.keymap)
+
+    r = ui._advance()
+    ui._write(r, 2, "─" * 48, COL_GREY, dim=True)
+    ui._flush()
+    ui.blank()
+
+    ui.print("What will be installed:", dim=True)
+    ui.print("  Filesystem:  btrfs + zstd (@, @home, @snapshots, @cache, @log)", dim=True)
+    ui.print("  Desktop:     Hyprland (Wayland) + SDDM", dim=True)
+    ui.print("  Audio:       PipeWire + WirePlumber", dim=True)
+    ui.print("  Networking:  NetworkManager (iwd backend) + systemd-resolved", dim=True)
+    ui.print("  Shell:       zsh", dim=True)
+    ui.print("  Terminal:    Kitty", dim=True)
+    ui.print("  Kernel:      linux-lts", dim=True)
+    ui.print("  Bootloader:  GRUB", dim=True)
+    ui.blank()
+
+    ui.warn(f"This will permanently erase ALL data on {cfg.disk}.")
+    ui.blank()
+
+    return ui.confirm("Proceed with installation?")
+
 
 # ============================================================
 # PARTITIONING
 # ============================================================
 
-stage "Preparing your disk"
+def _part_name(disk: str, n: int, is_nvme: bool) -> str:
+    """Return partition path for disk number n (1-indexed)."""
+    sep = "p" if is_nvme else ""
+    return f"{disk}{sep}{n}"
 
-echo ""
-progress 1 6 "Partitioning"
 
-wipefs -af "$DISK" &>/dev/null
-sgdisk \
-  -n1:0:+512M -t1:ef00 \
-  -n2:0:+${SWAP_SIZE} -t2:8200 \
-  -n3:0:0 -t3:8300 \
-  "$DISK" &>/dev/null
+def _resolve_partitions(cfg: InstallConfig) -> Optional[tuple[str, str, str]]:
+    """
+    Attempt to find partition nodes after partitioning.
+    Returns (part1, part2, part3) or None.
+    Handles both sda1 and nvme0n1p1 naming.
+    """
+    for candidate in [
+        (f"{cfg.disk}p1", f"{cfg.disk}p2", f"{cfg.disk}p3"),
+        (f"{cfg.disk}1",  f"{cfg.disk}2",  f"{cfg.disk}3"),
+    ]:
+        if all(Path(p).is_block_device() for p in candidate):
+            return candidate
+    return None
 
-if [[ "$DISK" == *"nvme"* ]]; then
-  EFI="${DISK}p1"
-  SWAP="${DISK}p2"
-  ROOT="${DISK}p3"
-else
-  EFI="${DISK}1"
-  SWAP="${DISK}2"
-  ROOT="${DISK}3"
-fi
 
-progress 2 6 "Formatting EFI partition"
-mkfs.fat -F32 "$EFI" &>/dev/null
+def _teardown_mounts():
+    """Unmount anything previously mounted under /mnt. Best-effort."""
+    mountpoints = [
+        "/mnt/boot/efi",
+        "/mnt/boot",
+        "/mnt/var/log",
+        "/mnt/var/cache",
+        "/mnt/.snapshots",
+        "/mnt/home",
+        "/mnt",
+    ]
+    for mp in mountpoints:
+        run(["umount", "-f", mp], check=False)
 
-progress 3 6 "Formatting swap"
-mkswap "$SWAP" &>/dev/null
-swapon "$SWAP"
 
-progress 4 6 "Formatting root (btrfs)"
-mkfs.btrfs -f "$ROOT" &>/dev/null
+def _swapoff_disk(cfg: InstallConfig):
+    """Disable any swap partitions on the target disk."""
+    active_swap = run_output("swapon --show=NAME --noheadings")
+    for line in active_swap.splitlines():
+        part = line.strip()
+        if part.startswith(cfg.disk):
+            run(["swapoff", part], check=False)
 
-progress 5 6 "Creating subvolumes"
-mount "$ROOT" /mnt
-for sv in @ @home @snapshots @cache @log; do
-  btrfs subvolume create "/mnt/${sv}" &>/dev/null
-done
-umount /mnt
 
-progress 6 6 "Mounting everything"
-BTRFS_OPTS="noatime,compress=zstd,space_cache=v2"
-mount -o "${BTRFS_OPTS},subvol=@" "$ROOT" /mnt
-mkdir -p /mnt/{home,.snapshots,var/cache,var/log,boot/efi}
-mount -o "${BTRFS_OPTS},subvol=@home" "$ROOT" /mnt/home
-mount -o "${BTRFS_OPTS},subvol=@snapshots" "$ROOT" /mnt/.snapshots
-mount -o "${BTRFS_OPTS},subvol=@cache" "$ROOT" /mnt/var/cache
-mount -o "${BTRFS_OPTS},subvol=@log" "$ROOT" /mnt/var/log
-mount "$EFI" /mnt/boot/efi
+def partition_disk(ui: TUI, cfg: InstallConfig):
+    ui.stage("Partitioning")
 
-ok "Disk ready"
+    _teardown_mounts()
+    _swapoff_disk(cfg)
 
-# ============================================================
-# INSTALL PACKAGES
-# ============================================================
+    ui.progress(1, 7, "Wiping disk signatures")
+    if run(["wipefs", "-af", cfg.disk], check=False).returncode != 0:
+        ui.die(f"wipefs failed on {cfg.disk}. Is the disk still in use?")
+    run(["sgdisk", "--zap-all", cfg.disk], check=False)
 
-stage "Installing LightArch"
+    ui.progress(2, 7, "Writing partition table")
 
-echo -e "  ${DIM}Downloading and installing packages."
-echo -e "  This is the longest step. Good time for that cup of tea.${RESET}"
-echo ""
+    if cfg.is_uefi:
+        # GPT: EFI + swap + root
+        sgdisk_args = [
+            "sgdisk",
+            "-n1:0:+512M",    "-t1:ef00", "-c1:EFI",
+            f"-n2:0:+{cfg.swap_mb}M", "-t2:8200", "-c2:swap",
+            "-n3:0:0",        "-t3:8300", "-c3:root",
+            cfg.disk,
+        ]
+    else:
+        # GPT for BIOS too — use a 1 MiB BIOS boot partition instead of EFI.
+        sgdisk_args = [
+            "sgdisk",
+            "-n1:0:+1M",      "-t1:ef02", "-c1:BIOSBOOT",
+            f"-n2:0:+{cfg.swap_mb}M", "-t2:8200", "-c2:swap",
+            "-n3:0:0",        "-t3:8300", "-c3:root",
+            cfg.disk,
+        ]
 
-pacstrap /mnt \
-  base linux linux-firmware \
-  amd-ucode intel-ucode \
-  btrfs-progs \
-  grub efibootmgr \
-  iwd \
-  pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber \
-  hyprland hyprlock hypridle \
-  quickshell \
-  swww swayosd wofi mako \
-  playerctl wl-clipboard grim slurp \
-  ghostty \
-  git curl wget base-devel sudo \
-  dbus dbus-broker \
-  sof-firmware \
-  sddm \
-  xdg-user-dirs \
-  polkit \
-  zsh \
-  fastfetch \
-  noto-fonts noto-fonts-emoji ttf-jetbrains-mono-nerd \
-  2>&1 | while IFS= read -r line; do
-  if [[ "$line" == *"installing"* ]] || [[ "$line" == *"Packages"* ]]; then
-    echo -e "  ${DIM}${line}${RESET}"
-  fi
-done || die "Package installation failed. Check your internet connection."
+    if run(sgdisk_args, check=False).returncode != 0:
+        ui.die(f"sgdisk failed on {cfg.disk}.")
 
-genfstab -U /mnt >>/mnt/etc/fstab
-ok "Packages installed"
+    # Force kernel to re-read the partition table.
+    run(["blockdev", "--rereadpt", cfg.disk], check=False)
+    if cmd_exists("udevadm"):
+        run(["udevadm", "settle", "--timeout=15"], check=False)
+    else:
+        time.sleep(4)
 
-# ============================================================
-# CONFIGURE SYSTEM
-# ============================================================
+    parts = _resolve_partitions(cfg)
+    if not parts:
+        # One more attempt after a longer wait.
+        time.sleep(5)
+        run(["blockdev", "--rereadpt", cfg.disk], check=False)
+        if cmd_exists("udevadm"):
+            run(["udevadm", "settle", "--timeout=15"], check=False)
+        parts = _resolve_partitions(cfg)
 
-stage "Configuring your system"
+    if not parts:
+        ui.die(
+            f"Partition nodes not found after partitioning {cfg.disk}. "
+            "Try running 'partprobe' manually or rebooting the live environment."
+        )
 
-# Write the chroot script to a file rather than a heredoc
-# This avoids nested heredoc nightmares and sudo issues
-cat >/mnt/lightarch-configure.sh <<SCRIPT
-#!/bin/bash
-set -e
+    efi_or_bios_boot, cfg.swap_part, cfg.root_part = parts
+    if cfg.is_uefi:
+        cfg.efi_part = efi_or_bios_boot
 
-RESET='\033[0m'
-BOLD='\033[1m'
-DIM='\033[2m'
-GREEN='\033[38;5;114m'
+    for p in (efi_or_bios_boot, cfg.swap_part, cfg.root_part):
+        if not Path(p).is_block_device():
+            ui.die(f"Expected partition {p} does not exist after partitioning.")
 
-progress() {
-  local step=\$1
-  local total=\$2
-  local label=\$3
-  local filled=\$(( step * 30 / total ))
-  local empty=\$(( 30 - filled ))
-  local bar=""
-  for ((i=0; i<filled; i++)); do bar+="█"; done
-  for ((i=0; i<empty; i++)); do bar+="░"; done
-  echo -e "  \${DIM}[\${bar}]  \${step}/\${total}  \${label}\${RESET}"
-}
+    ui.progress(3, 7, "Formatting EFI / BIOS boot partition")
+    if cfg.is_uefi:
+        if run(["mkfs.fat", "-F32", "-n", "EFI", cfg.efi_part], check=False).returncode != 0:
+            ui.die(f"mkfs.fat failed on {cfg.efi_part}.")
+    # BIOS boot partition needs no filesystem — GRUB writes directly to it.
 
-trap 'echo -e "\n  \033[38;5;203m✗  Configuration failed at line \$LINENO. Check /tmp/lightarch-error.log\033[0m\n"; exit 1' ERR
+    ui.progress(4, 7, "Formatting swap")
+    if run(["mkswap", "-L", "swap", cfg.swap_part], check=False).returncode != 0:
+        ui.die(f"mkswap failed on {cfg.swap_part}.")
+    if run(["swapon", cfg.swap_part], check=False).returncode != 0:
+        ui.warn(f"swapon failed on {cfg.swap_part} — installation may proceed but swap may not activate.")
 
-# ── Timezone ───────────────────────────────────────────────
-progress 1 8 "Setting timezone and clock"
-ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
-hwclock --systohc
+    ui.progress(5, 7, "Formatting root (btrfs)")
+    if run(["mkfs.btrfs", "-f", "-L", "LightArch", cfg.root_part], check=False).returncode != 0:
+        ui.die(f"mkfs.btrfs failed on {cfg.root_part}.")
 
-# ── Locale ────────────────────────────────────────────────
-progress 2 8 "Setting language"
-echo "${LOCALE} UTF-8" >> /etc/locale.gen
-locale-gen &>/dev/null
-echo "LANG=${LOCALE}" > /etc/locale.conf
+    ui.progress(6, 7, "Creating btrfs subvolumes")
+    if run(["mount", cfg.root_part, "/mnt"], check=False).returncode != 0:
+        ui.die("Failed to mount root partition to create subvolumes.")
 
-# ── Hostname ──────────────────────────────────────────────
-progress 3 8 "Configuring hostname"
-echo "${HOSTNAME}" > /etc/hostname
-printf '127.0.0.1   localhost\n::1         localhost\n127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}\n' > /etc/hosts
+    subvols = ("@", "@home", "@snapshots", "@cache", "@log")
+    for sv in subvols:
+        if run(["btrfs", "subvolume", "create", f"/mnt/{sv}"], check=False).returncode != 0:
+            run(["umount", "-f", "/mnt"], check=False)
+            ui.die(f"Failed to create btrfs subvolume '{sv}'.")
 
-# ── OS identity ───────────────────────────────────────────
-printf 'NAME="LightArch"\nPRETTY_NAME="LightArch 0.11"\nID=lightarch\nID_LIKE=arch\nBUILD_ID=0.11\nANSI_COLOR="38;2;100;200;255"\nHOME_URL="https://github.com/kantiankant/lightarch"\nBUG_REPORT_URL="https://github.com/kantiankant/lightarch/issues"\n' > /etc/os-release
+    run(["umount", "/mnt"])
 
-# ── User ──────────────────────────────────────────────────
-progress 4 8 "Creating your account"
-useradd -mG wheel,audio,video,input,storage -s /bin/zsh "${USERNAME}"
-echo "${USERNAME}:${PASSWORD}" | chpasswd
-echo "root:${PASSWORD}" | chpasswd
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+    ui.progress(7, 7, "Mounting filesystems")
+    btrfs_opts = "noatime,compress=zstd:3,space_cache=v2,commit=120"
 
-# ── XDG dirs ─────────────────────────────────────────────
-su - "${USERNAME}" -c "xdg-user-dirs-update" &>/dev/null || true
+    def _mount_subvol(subvol: str, mountpoint: str):
+        Path(mountpoint).mkdir(parents=True, exist_ok=True)
+        r = run(
+            ["mount", "-o", f"{btrfs_opts},subvol={subvol}", cfg.root_part, mountpoint],
+            check=False,
+        )
+        if r.returncode != 0:
+            ui.die(f"Failed to mount subvolume '{subvol}' at '{mountpoint}'.")
 
-# ── PipeWire (user service symlinks) ─────────────────────
-progress 5 8 "Enabling audio"
-WANTS_DIR="/home/${USERNAME}/.config/systemd/user/default.target.wants"
-mkdir -p "\$WANTS_DIR"
-ln -sf /usr/lib/systemd/user/pipewire.service       "\$WANTS_DIR/pipewire.service"
-ln -sf /usr/lib/systemd/user/pipewire-pulse.service "\$WANTS_DIR/pipewire-pulse.service"
-ln -sf /usr/lib/systemd/user/wireplumber.service    "\$WANTS_DIR/wireplumber.service"
-chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
+    _mount_subvol("@",          "/mnt")
+    _mount_subvol("@home",      "/mnt/home")
+    _mount_subvol("@snapshots", "/mnt/.snapshots")
+    _mount_subvol("@cache",     "/mnt/var/cache")
+    _mount_subvol("@log",       "/mnt/var/log")
 
-# ── iwd ──────────────────────────────────────────────────
-progress 6 8 "Configuring desktop"
-mkdir -p /etc/iwd
-printf '[General]\nEnableNetworkConfiguration=true\n\n[Network]\nNameResolvingService=resolvconf\n' > /etc/iwd/main.conf
+    if cfg.is_uefi:
+        Path("/mnt/boot/efi").mkdir(parents=True, exist_ok=True)
+        if run(["mount", cfg.efi_part, "/mnt/boot/efi"], check=False).returncode != 0:
+            ui.die(f"Failed to mount EFI partition at /mnt/boot/efi.")
+    else:
+        Path("/mnt/boot").mkdir(parents=True, exist_ok=True)
 
-# ── Wayland session entry ─────────────────────────────────
-mkdir -p /usr/share/wayland-sessions
-printf '[Desktop Entry]\nName=Hyprland\nComment=An intelligent dynamic tiling Wayland compositor\nExec=Hyprland\nType=Application\nDesktopNames=Hyprland\n' > /usr/share/wayland-sessions/hyprland.desktop
+    ui.ok("Disk partitioned and mounted")
 
-# ── SDDM ─────────────────────────────────────────────────
-mkdir -p /etc/sddm.conf.d
-printf '[General]\nDisplayServer=wayland\nGreeterEnvironment=QT_WAYLAND_SHELL_INTEGRATION=layer-shell\n\n[Wayland]\nCompositorCommand=kwin_wayland --no-global-shortcuts --no-kactivities --inputmethod qtvirtualkeyboard\n' > /etc/sddm.conf.d/10-wayland.conf
-
-# ── mkinitcpio ────────────────────────────────────────────
-progress 7 8 "Building kernel"
-echo "KEYMAP=us" > /etc/vconsole.conf
-sed -i 's/^MODULES=()/MODULES=(btrfs)/' /etc/mkinitcpio.conf
-mkinitcpio -P 2>&1 | grep -E "ERROR|WARNING" || true
-
-# ── Services ─────────────────────────────────────────────
-systemctl enable iwd    &>/dev/null
-systemctl enable dbus   &>/dev/null
-systemctl enable sddm   &>/dev/null
-
-# ── GRUB ─────────────────────────────────────────────────
-progress 8 8 "Setting up boot"
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB &>/dev/null
-grub-mkconfig -o /boot/grub/grub.cfg &>/dev/null
-
-echo -e "  \${GREEN}✓\${RESET}  System configured"
-SCRIPT
-
-chmod +x /mnt/lightarch-configure.sh
-arch-chroot /mnt /bin/bash /lightarch-configure.sh 2>/tmp/lightarch-error.log || {
-  echo ""
-  echo -e "  ${RED}✗  Configuration failed.${RESET}"
-  echo -e "  ${DIM}Error log: /tmp/lightarch-error.log${RESET}"
-  echo -e "  ${DIM}Run: cat /tmp/lightarch-error.log${RESET}"
-  echo ""
-  exit 1
-}
-
-# Clean up
-rm -f /mnt/lightarch-configure.sh
 
 # ============================================================
-# DONE
+# PACKAGE INSTALLATION
 # ============================================================
 
-umount -R /mnt
+def _detect_ucode(cfg: InstallConfig):
+    """Detect CPU vendor and set cfg.ucode_pkg."""
+    if Path("/proc/cpuinfo").exists():
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+        if "GenuineIntel" in cpuinfo:
+            cfg.ucode_pkg = "intel-ucode"
+        elif "AuthenticAMD" in cpuinfo:
+            cfg.ucode_pkg = "amd-ucode"
 
-clear
-echo ""
-echo ""
-echo -e "  ${GREEN}${BOLD}Installation complete.${RESET}"
-echo ""
-echo -e "  ${WHITE}LightArch is ready.${RESET}"
-echo ""
-echo -e "  ${DIM}What just happened:${RESET}"
-echo -e "  ${DIM}  ✓  LightArch installed to ${DISK}${RESET}"
-echo -e "  ${DIM}  ✓  Account '${USERNAME}' created${RESET}"
-echo -e "  ${DIM}  ✓  Hyprland + SDDM configured${RESET}"
-echo -e "  ${DIM}  ✓  PipeWire audio enabled${RESET}"
-echo -e "  ${DIM}  ✓  System boots automatically to login screen${RESET}"
-echo ""
-echo -e "  ${DIM}Type ${RESET}${BOLD}reboot${RESET}${DIM} when you're ready.${RESET}"
-echo ""
-echo -e "  ${GREY}──────────────────────────────────────────${RESET}"
-echo -e "  ${DIM}NVIDIA users: the Arch wiki is your friend.${RESET}"
-echo -e "  ${DIM}github.com/kantiankant/lightarch${RESET}"
-echo ""
+
+def _tweak_pacman_conf():
+    """Enable parallel downloads in the live environment's pacman.conf."""
+    conf = Path("/etc/pacman.conf")
+    if not conf.exists():
+        return
+    text = conf.read_text()
+    text = re.sub(r"#?\s*ParallelDownloads\s*=\s*\d+", "ParallelDownloads = 10", text)
+    # Enable colour — makes the log easier to read.
+    text = re.sub(r"^#\s*Color\s*$", "Color", text, flags=re.MULTILINE)
+    conf.write_text(text)
+
+
+def install_packages(ui: TUI, cfg: InstallConfig):
+    ui.stage("Installing LightArch")
+    ui.print("Downloading and installing packages. This is the long step.", dim=True)
+    ui.print("Go and make a cup of tea.", dim=True)
+    ui.blank()
+
+    _detect_ucode(cfg)
+    _tweak_pacman_conf()
+
+    # Pre-create vconsole.conf to prevent mkinitcpio warnings.
+    vconsole_dir = Path("/mnt/etc")
+    vconsole_dir.mkdir(parents=True, exist_ok=True)
+    vconsole_path = vconsole_dir / "vconsole.conf"
+    if not vconsole_path.exists():
+        vconsole_path.write_text(f"KEYMAP={cfg.keymap}\nFONT=ter-v18n\n")
+
+    packages = [
+        # Base
+        "base", "linux-lts", "linux-firmware",
+        *(([cfg.ucode_pkg]) if cfg.ucode_pkg else []),
+        "btrfs-progs",
+        # Bootloader
+        "grub", "efibootmgr", "os-prober",
+        # Networking
+        "iwd", "networkmanager",
+        # Audio
+        "pipewire", "pipewire-alsa", "pipewire-pulse", "pipewire-jack", "wireplumber",
+        # Wayland / Hyprland stack
+        "hyprland", "hyprlock", "hypridle",
+        "swww", "wofi", "mako",
+        "playerctl", "wl-clipboard", "grim", "slurp",
+        "xdg-desktop-portal-hyprland",
+        # Terminal
+        "Kitty",
+        # Display manager
+        "sddm",
+        # XDG
+        "xdg-user-dirs", "xdg-utils",
+        # Auth / polkit
+        "polkit", "polkit-gnome",
+        # Shell
+        "zsh", "zsh-completions",
+        # DBus
+        "dbus-broker", "dbus-broker-units",
+        # Fonts
+        "noto-fonts", "noto-fonts-emoji", "ttf-jetbrains-mono-nerd",
+        # Firmware
+        "sof-firmware",
+        # Base tools
+        "base-devel", "git", "curl", "wget", "sudo",
+        # System utilities
+        "fastfetch", "htop", "nvme-cli",
+        "zip", "unzip", "nano", "vim",
+        "terminus-font",
+        # Python
+        "python", "python-pip",
+        # Explicit iptables variant — prevents interactive prompt
+        "iptables-nft",
+    ]
+
+    log_path = "/tmp/lightarch-pacstrap.log"
+
+    ui.info("Running pacstrap (this will take several minutes)...")
+    ui.blank()
+
+    returncode, lines = run_stream(
+        ["pacstrap", "-K", "-M", "/mnt"] + packages,
+        log_path,
+    )
+
+    # Surface interesting lines in the TUI without going overboard.
+    shown = 0
+    for line in lines:
+        lower = line.lower()
+        if any(kw in lower for kw in ("error", "failed", "warning")):
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if clean and shown < 30:
+                ui.print(clean, COL_YELLOW, indent=4)
+                shown += 1
+
+    if returncode != 0:
+        shutil.copy(log_path, "/tmp/lightarch-pacstrap-failed.log")
+        ui.blank()
+        ui.warn("pacstrap failed. Last 15 lines of output:")
+        for line in lines[-15:]:
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if clean:
+                ui.print(clean, COL_RED, indent=4)
+        ui.die(
+            f"pacstrap exited with code {returncode}. "
+            "Full log at /tmp/lightarch-pacstrap-failed.log. "
+            "Common causes: no internet, full disk, bad mirror."
+        )
+
+    # Hard sanity checks — a zero exit doesn't guarantee success.
+    for expected in ["/mnt/etc", "/mnt/usr/bin", "/mnt/boot"]:
+        if not Path(expected).is_dir():
+            ui.die(
+                f"pacstrap returned success but '{expected}' is missing. "
+                f"Check /tmp/lightarch-pacstrap.log — the disk may be full."
+            )
+
+    ui.ok("Packages installed")
+
+    # Generate fstab
+    ui.info("Generating fstab...")
+    ret = subprocess.run(
+        "genfstab -U /mnt >> /mnt/etc/fstab",
+        shell=True, check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if ret.returncode != 0:
+        ui.die("genfstab failed.")
+
+    fstab = Path("/mnt/etc/fstab")
+    if not fstab.exists() or len(fstab.read_text().strip()) < 20:
+        ui.die("/etc/fstab is missing or suspiciously empty after genfstab.")
+    ui.ok("fstab generated")
+
+
+# ============================================================
+# CHROOT CONFIGURATION
+# ============================================================
+#
+# Rather than one massive embedded shell script (which is a debugging
+# nightmare when it fails), each step is a discrete function that
+# calls arch_chroot() directly. Each step is independently logged
+# and independently verifiable.
+#
+# The pattern is:
+#   rc, lines = arch_chroot([...], ...)
+#   if rc != 0: ui.die(...)
+#
+# This means a failure in step 6 tells you exactly which step failed.
+
+def _chroot(ui: TUI, description: str, cmd: list[str], *,
+            input_text: Optional[str] = None,
+            env: Optional[dict] = None,
+            fatal: bool = True) -> tuple[int, list[str]]:
+    """
+    Run *cmd* inside arch-chroot /mnt.
+    Logs description. If *fatal* and rc != 0, calls ui.die().
+    """
+    ui.info(description)
+    rc, lines = arch_chroot(
+        cmd,
+        input_text=input_text,
+        log_path="/tmp/lightarch-install.log",
+        env=env,
+    )
+    if rc != 0 and fatal:
+        last = "\n".join(
+            re.sub(r"\x1b\[[0-9;]*m", "", l).strip()
+            for l in lines[-8:] if l.strip()
+        )
+        ui.die(f"{description} failed (exit {rc}).\n{last}")
+    return rc, lines
+
+
+def configure_system(ui: TUI, cfg: InstallConfig):
+    ui.stage("Configuring your system")
+    ui.blank()
+
+    Path("/mnt/tmp").mkdir(parents=True, exist_ok=True)
+    os.chmod("/mnt/tmp", 0o1777)
+
+    chroot_env = {
+        "USERNAME": cfg.username,
+        "HOSTNAME": cfg.hostname,
+        "TIMEZONE": cfg.timezone,
+        "LOCALE":   cfg.locale,
+        "KEYMAP":   cfg.keymap,
+    }
+
+    total = 12
+
+    # ── 1. Timezone ──────────────────────────────────────
+    ui.progress(1, total, "Setting timezone")
+    tz_file = f"/usr/share/zoneinfo/{cfg.timezone}"
+    _chroot(ui, "Setting timezone", [
+        "sh", "-c",
+        f"ln -sf '{tz_file}' /etc/localtime && hwclock --systohc 2>/dev/null || true"
+    ])
+    ui.ok(f"Timezone: {cfg.timezone}")
+
+    # ── 2. Locale ────────────────────────────────────────
+    ui.progress(2, total, "Generating locale")
+    _chroot(ui, "Uncommenting locale", [
+        "sh", "-c",
+        f"grep -q '^{cfg.locale}' /etc/locale.gen || "
+        f"sed -i 's/^#\\({cfg.locale}\\)/\\1/' /etc/locale.gen || "
+        f"echo '{cfg.locale} UTF-8' >> /etc/locale.gen"
+    ])
+    _chroot(ui, "Running locale-gen", ["locale-gen"])
+    _chroot(ui, "Writing locale.conf", [
+        "sh", "-c", f"echo 'LANG={cfg.locale}' > /etc/locale.conf"
+    ])
+    ui.ok(f"Locale: {cfg.locale}")
+
+    # ── 3. Console ───────────────────────────────────────
+    ui.progress(3, total, "Configuring console")
+    vconsole_content = f"KEYMAP={cfg.keymap}\nFONT=ter-v18n\n"
+    # Write directly from the host — simpler than passing through arch-chroot.
+    Path("/mnt/etc/vconsole.conf").write_text(vconsole_content)
+    ui.ok(f"Console keymap: {cfg.keymap}")
+
+    # ── 4. Hostname ──────────────────────────────────────
+    ui.progress(4, total, "Setting hostname")
+    Path("/mnt/etc/hostname").write_text(cfg.hostname + "\n")
+    hosts_content = (
+        "127.0.0.1   localhost\n"
+        "::1         localhost\n"
+        f"127.0.1.1   {cfg.hostname}.localdomain {cfg.hostname}\n"
+    )
+    Path("/mnt/etc/hosts").write_text(hosts_content)
+    ui.ok(f"Hostname: {cfg.hostname}")
+
+    # ── OS release ───────────────────────────────────────
+    Path("/mnt/etc/os-release").write_text(
+        f"NAME=\"LightArch\"\n"
+        f"PRETTY_NAME=\"LightArch {VERSION}\"\n"
+        f"ID=lightarch\n"
+        f"ID_LIKE=arch\n"
+        f"BUILD_ID={VERSION}\n"
+        f"ANSI_COLOR=\"38;2;100;200;255\"\n"
+        f"HOME_URL=\"https://github.com/kantiankant/lightarch\"\n"
+        f"BUG_REPORT_URL=\"https://github.com/kantiankant/lightarch/issues\"\n"
+    )
+
+    # ── 5. User account ──────────────────────────────────
+    ui.progress(5, total, "Creating user account")
+
+    # Build group list from what actually exists in the chroot.
+    groups_check = _chroot(
+        ui, "Listing available groups",
+        ["cut", "-d:", "-f1", "/etc/group"],
+        fatal=False,
+    )[1]
+    available_groups = {l.strip() for l in groups_check}
+    wanted = ["wheel", "audio", "video", "input", "storage", "optical", "network"]
+    actual_groups = ",".join(g for g in wanted if g in available_groups) or "wheel"
+
+    _chroot(ui, "Creating user", [
+        "useradd", "-m", "-G", actual_groups, "-s", "/bin/zsh", cfg.username
+    ])
+
+    # Set passwords via chpasswd — passwords arrive on stdin, never in argv or env.
+    chpasswd_input = (
+        f"{cfg.username}:{cfg._password_plain}\n"
+        f"root:{cfg._password_plain}\n"
+    )
+    _chroot(ui, "Setting passwords", ["chpasswd"], input_text=chpasswd_input)
+
+    # Sudo
+    _chroot(ui, "Enabling sudo for wheel", [
+        "sh", "-c",
+        "sed -i 's/^# *%wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers"
+    ])
+    # Verify sudoers is still valid.
+    rc_visudo, _ = _chroot(
+        ui, "Validating sudoers", ["visudo", "-c"], fatal=False
+    )
+    if rc_visudo != 0:
+        ui.warn("visudo -c returned non-zero — sudoers may need manual review.")
+
+    _chroot(ui, "Creating XDG user directories", [
+        "su", "-", cfg.username, "-c", "xdg-user-dirs-update"
+    ], fatal=False)
+    ui.ok(f"User: {cfg.username}")
+
+    # ── 6. Audio (PipeWire) ──────────────────────────────
+    ui.progress(6, total, "Enabling PipeWire")
+    # Enable lingering so user services start without a login session.
+    Path("/var/lib/systemd/linger").mkdir(parents=True, exist_ok=True)
+    Path(f"/var/lib/systemd/linger/{cfg.username}").touch()
+
+    wants_dir = Path(f"/mnt/home/{cfg.username}/.config/systemd/user/default.target.wants")
+    wants_dir.mkdir(parents=True, exist_ok=True)
+    for svc in ("pipewire.service", "pipewire-pulse.service", "wireplumber.service"):
+        unit = Path(f"/mnt/usr/lib/systemd/user/{svc}")
+        link = wants_dir / svc
+        if unit.exists():
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            link.symlink_to(unit)
+        else:
+            ui.warn(f"Systemd unit {svc} not found — PipeWire may need manual setup post-install.")
+
+    # Fix ownership
+    _chroot(ui, "Fixing home directory ownership", [
+        "chown", "-R", f"{cfg.username}:{cfg.username}", f"/home/{cfg.username}"
+    ])
+    ui.ok("PipeWire user services linked")
+
+    # ── 7. Networking ────────────────────────────────────
+    ui.progress(7, total, "Configuring networking")
+    Path("/mnt/etc/iwd").mkdir(parents=True, exist_ok=True)
+    Path("/mnt/etc/iwd/main.conf").write_text(
+        "[General]\nEnableNetworkConfiguration=false\n"
+    )
+    Path("/mnt/etc/NetworkManager/conf.d").mkdir(parents=True, exist_ok=True)
+    Path("/mnt/etc/NetworkManager/conf.d/wifi-backend.conf").write_text(
+        "[device]\nwifi.backend=iwd\n"
+    )
+    Path("/mnt/etc/systemd/resolved.conf.d").mkdir(parents=True, exist_ok=True)
+    Path("/mnt/etc/systemd/resolved.conf.d/10-lightarch.conf").write_text(
+        "[Resolve]\n"
+        "DNS=1.1.1.1 8.8.8.8\n"
+        "FallbackDNS=1.0.0.1 8.8.4.4\n"
+        "DNSSEC=allow-downgrade\n"
+        "DNSOverTLS=opportunistic\n"
+    )
+    # resolv.conf symlink — done from the host, not inside the chroot.
+    # Inside the chroot /etc/resolv.conf may be a bind-mount from the live
+    # environment (systemd-resolved holds it), so rm -f will return EBUSY.
+    # From the host we can manipulate /mnt/etc/resolv.conf freely.
+    resolv = Path("/mnt/etc/resolv.conf")
+    try:
+        if resolv.exists() or resolv.is_symlink():
+            resolv.unlink()
+        resolv.symlink_to("/run/systemd/resolve/stub-resolv.conf")
+        ui.ok("resolv.conf symlinked")
+    except OSError as exc:
+        ui.warn(f"Could not symlink resolv.conf: {exc} — DNS may need manual setup post-install.")
+    ui.ok("Networking: NetworkManager + iwd + systemd-resolved")
+
+    # ── 8. Desktop (Hyprland + SDDM) ─────────────────────
+    ui.progress(8, total, "Configuring desktop")
+    Path("/mnt/usr/share/wayland-sessions").mkdir(parents=True, exist_ok=True)
+    Path("/mnt/usr/share/wayland-sessions/hyprland.desktop").write_text(
+        "[Desktop Entry]\n"
+        "Name=Hyprland\n"
+        "Comment=Intelligent dynamic tiling Wayland compositor\n"
+        "Exec=Hyprland\n"
+        "Type=Application\n"
+        "DesktopNames=Hyprland\n"
+    )
+    Path("/mnt/etc/sddm.conf.d").mkdir(parents=True, exist_ok=True)
+    Path("/mnt/etc/sddm.conf.d/10-wayland.conf").write_text(
+        "[General]\nDisplayServer=wayland\n"
+        "[Wayland]\nSessionDir=/usr/share/wayland-sessions\n"
+    )
+    ui.ok("Hyprland + SDDM configured")
+
+    # ── 9. Initramfs ─────────────────────────────────────
+    ui.progress(9, total, "Building initramfs")
+    mkinitcpio_conf = (
+        "MODULES=(btrfs)\n"
+        "BINARIES=()\n"
+        "FILES=()\n"
+        "HOOKS=(base udev autodetect microcode modconf kms keyboard keymap consolefont block filesystems fsck)\n"
+    )
+    Path("/mnt/etc/mkinitcpio.conf").write_text(mkinitcpio_conf)
+
+    # Try the preset first; fall back to -P.
+    if Path("/mnt/etc/mkinitcpio.d/linux-lts.preset").exists():
+        rc_mk, lines_mk = _chroot(ui, "Running mkinitcpio -p linux-lts",
+                                  ["mkinitcpio", "-p", "linux-lts"], fatal=False)
+    else:
+        ui.warn("linux-lts preset not found — using mkinitcpio -P (all presets)")
+        rc_mk, lines_mk = _chroot(ui, "Running mkinitcpio -P",
+                                  ["mkinitcpio", "-P"], fatal=False)
+
+    if rc_mk != 0:
+        for line in lines_mk[-10:]:
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if clean:
+                ui.print(clean, COL_RED, indent=4)
+        ui.die("mkinitcpio failed. Check /tmp/lightarch-install.log.")
+
+    if not Path("/mnt/boot/initramfs-linux-lts.img").exists():
+        ui.die("mkinitcpio ran successfully but initramfs image is missing from /mnt/boot/.")
+    ui.ok("Initramfs built")
+
+    # ── 10. System services ──────────────────────────────
+    ui.progress(10, total, "Enabling system services")
+    services = ["iwd", "NetworkManager", "systemd-resolved", "dbus-broker", "sddm"]
+    for svc in services:
+        rc_svc, _ = _chroot(ui, f"Enabling {svc}", ["systemctl", "enable", svc], fatal=False)
+        if rc_svc != 0:
+            ui.warn(f"Could not enable {svc} — enable manually post-install: systemctl enable {svc}")
+        else:
+            ui.ok(f"Enabled: {svc}")
+
+    # ── 11. Bootloader ───────────────────────────────────
+    ui.progress(11, total, "Installing bootloader (GRUB)")
+
+    if cfg.is_uefi:
+        _chroot(ui, "Installing GRUB (UEFI)", [
+            "grub-install",
+            "--target=x86_64-efi",
+            "--efi-directory=/boot/efi",
+            "--bootloader-id=GRUB",
+            "--recheck",
+        ])
+        # Fallback / removable entry for awkward firmware.
+        _chroot(ui, "Installing GRUB removable entry", [
+            "grub-install",
+            "--target=x86_64-efi",
+            "--efi-directory=/boot/efi",
+            "--bootloader-id=GRUB",
+            "--removable",
+        ], fatal=False)
+    else:
+        _chroot(ui, "Installing GRUB (BIOS/MBR)", [
+            "grub-install",
+            "--target=i386-pc",
+            f"--boot-directory=/boot",
+            cfg.disk,
+        ])
+
+    # Append sane defaults to grub config.
+    grub_default = Path("/mnt/etc/default/grub")
+    if grub_default.exists():
+        grub_text = grub_default.read_text()
+        if "GRUB_DISABLE_OS_PROBER" not in grub_text:
+            grub_text += "\nGRUB_DISABLE_OS_PROBER=true\n"
+        # Quiet boot — less noise.
+        grub_text = re.sub(
+            r'GRUB_CMDLINE_LINUX_DEFAULT=".*?"',
+            'GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 systemd.show_status=auto rd.udev.log_level=3"',
+            grub_text,
+        )
+        grub_default.write_text(grub_text)
+
+    _chroot(ui, "Generating GRUB config", [
+        "grub-mkconfig", "-o", "/boot/grub/grub.cfg"
+    ])
+    ui.ok("GRUB installed and configured")
+
+    # ── 12. Post-install sanity check ────────────────────
+    ui.progress(12, total, "Verifying installation")
+
+    required_paths = [
+        "/mnt/boot/grub/grub.cfg",
+        "/mnt/boot/initramfs-linux-lts.img",
+        "/mnt/etc/fstab",
+        "/mnt/etc/hostname",
+        "/mnt/etc/locale.conf",
+        f"/mnt/home/{cfg.username}",
+        "/mnt/usr/bin/zsh",
+    ]
+    if cfg.is_uefi:
+        required_paths.append("/mnt/boot/efi/EFI/GRUB/grubx64.efi")
+
+    missing = [p for p in required_paths if not Path(p).exists()]
+    if missing:
+        for p in missing:
+            ui.warn(f"Expected path missing: {p}")
+        ui.die(
+            "Post-install verification failed — one or more expected files are absent. "
+            "The system may not boot. Check /tmp/lightarch-install.log."
+        )
+
+    ui.ok("Installation verified")
+
+
+# ============================================================
+# FINALISE
+# ============================================================
+
+def finalise(ui: TUI, cfg: InstallConfig):
+    ui.stage("Finishing up")
+
+    # Copy install log into the new system.
+    log_src = Path("/tmp/lightarch-install.log")
+    if log_src.exists():
+        log_dst = Path("/mnt/var/log/lightarch-install.log")
+        log_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(str(log_src), str(log_dst))
+        ui.ok(f"Install log saved to /var/log/lightarch-install.log")
+
+    ui.info("Syncing filesystems...")
+    run(["sync"])
+
+    ui.info("Unmounting...")
+    _teardown_mounts()
+
+    if cfg.swap_part:
+        run(["swapoff", cfg.swap_part], check=False)
+
+    ui.ok("All filesystems unmounted cleanly")
+
+
+# ============================================================
+# DONE SCREEN
+# ============================================================
+
+def done_screen(ui: TUI, cfg: InstallConfig):
+    ui.scr.clear()
+    ui._row = 0
+    ui.blank()
+    ui.blank()
+
+    r = ui._advance()
+    ui._write(r, 2, "Installation complete.", COL_GREEN, bold=True)
+    ui.blank()
+    r = ui._advance()
+    ui._write(r, 2, f"LightArch {VERSION} is installed and ready.", COL_WHITE)
+    ui.blank()
+
+    for msg in [
+        f"LightArch {VERSION} installed to {cfg.disk}",
+        f"User '{cfg.username}' created with sudo (wheel) access",
+        "Hyprland + SDDM configured for Wayland",
+        "PipeWire audio enabled as user service",
+        "NetworkManager + iwd backend enabled",
+        "systemd-resolved configured (Cloudflare + Google DNS)",
+        "GRUB installed (standard + fallback EFI entries)" if cfg.is_uefi
+        else "GRUB installed (BIOS/MBR)",
+        "Install log saved to /var/log/lightarch-install.log",
+    ]:
+        ui.ok(msg)
+
+    ui.blank()
+    ui.warn("AUR-only packages (not installed — install post-boot):")
+    ui.print("  yay -S quickshell swayosd", dim=True)
+    ui.blank()
+
+    if cfg.ucode_pkg == "":
+        ui.warn("CPU microcode not detected — verify manually post-install.")
+
+    r = ui._advance()
+    ui._write(r, 2, "─" * 48, COL_GREY, dim=True)
+    ui._flush()
+    r = ui._advance()
+    ui._write(r, 2, "NVIDIA users: see wiki.archlinux.org/title/NVIDIA", COL_GREY, dim=True)
+    r = ui._advance()
+    ui._write(r, 2, "github.com/kantiankant/lightarch", COL_GREY, dim=True)
+    ui.blank()
+    r = ui._advance()
+    ui._write(r, 2, "Remove the installation media, then type: reboot", COL_WHITE, bold=True)
+    ui.blank()
+    r = ui._advance()
+    ui._write(r, 2, "Press any key to exit the installer.", COL_GREY, dim=True)
+    ui._flush()
+
+    curses.curs_set(0)
+    ui.scr.getch()
+
+
+# ============================================================
+# WELCOME SCREEN
+# ============================================================
+
+LOGO = r"""
+    __    _       __    __   ___              __
+   / /   (_)___ _/ /_  / /  /   |  __________/ /_
+  / /   / / __ `/ __ \/ /  / /| | / ___/ ___/ __ \
+ / /___/ / /_/ / / / / /  / ___ |/ /  / /__/ / / /
+/_____/_/\__, /_/ /_/_/  /_/  |_/_/   \___/_/ /_/
+        /____/
+"""
+
+def welcome_screen(ui: TUI):
+    ui.scr.clear()
+    ui._row = 0
+    ui.blank()
+    for line in LOGO.splitlines():
+        r = ui._advance()
+        ui._write(r, 2, line, COL_BLUE, bold=True)
+    ui._flush()
+    ui.blank()
+
+    r = ui._advance()
+    ui._write(r, 2, f"LightArch Installer  v{VERSION}", COL_WHITE, bold=True)
+    ui.blank()
+
+    ui.print("This installer will guide you through a complete Hyprland + btrfs", dim=True)
+    ui.print("setup in 10–20 minutes, depending on your connection speed.", dim=True)
+    ui.blank()
+    ui.print("Requirements:", dim=True)
+    ui.print("  ·  UEFI or BIOS system", dim=True)
+    ui.print("  ·  Internet connection", dim=True)
+    ui.print("  ·  At least 10 GB of disk space", dim=True)
+    ui.print("  ·  At least 512 MB RAM (2 GB+ recommended)", dim=True)
+    ui.blank()
+    ui.warn("Your chosen disk will be completely erased.")
+    ui.blank()
+
+    r = ui._advance()
+    ui._write(r, 2, "Press ")
+    ui._write(r, 8,  "Enter", COL_WHITE, bold=True)
+    ui._write(r, 13, " to begin, or ")
+    ui._write(r, 27, "Ctrl+C", COL_WHITE, bold=True)
+    ui._write(r, 33, " to abort.")
+    ui._flush()
+
+    curses.echo()
+    try:
+        ui.scr.getstr()
+    finally:
+        curses.noecho()
+
+
+# ============================================================
+# CLEANUP  (on unexpected exit)
+# ============================================================
+
+def cleanup(cfg: InstallConfig):
+    """
+    Best-effort teardown. Called on SIGINT, SIGTERM, or unhandled exception.
+    Scrubs the plaintext password from memory first.
+    """
+    cfg.wipe_password()
+
+    for mp in [
+        "/mnt/boot/efi", "/mnt/boot",
+        "/mnt/var/log", "/mnt/var/cache",
+        "/mnt/.snapshots", "/mnt/home", "/mnt",
+    ]:
+        subprocess.run(
+            ["umount", "-f", mp], check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    if cfg.swap_part:
+        subprocess.run(
+            ["swapoff", cfg.swap_part], check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    # Remove any stale chroot scripts.
+    for stale in ["/mnt/lightarch-configure.sh", "/mnt/tmp/lightarch-configure-status"]:
+        try:
+            Path(stale).unlink()
+        except Exception:
+            pass
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main(stdscr):
+    cfg = InstallConfig()
+    ui  = TUI(stdscr)
+
+    # ── Signal handlers ───────────────────────────────────
+    def _on_signal(signum, frame):
+        ui.save_log()
+        cleanup(cfg)
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT,  _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        welcome_screen(ui)
+        check_preflight(ui, cfg)
+        check_network(ui)
+        select_disk(ui, cfg)
+        collect_user_details(ui, cfg)
+        select_keymap(ui, cfg)
+        select_timezone(ui, cfg)
+        select_locale(ui, cfg)
+
+        if not review_and_confirm(ui, cfg):
+            cfg.wipe_password()
+            ui.print("  Nothing was changed. Exiting.")
+            time.sleep(1)
+            return
+
+        partition_disk(ui, cfg)
+        install_packages(ui, cfg)
+        configure_system(ui, cfg)
+
+        # Password is no longer needed after configuration.
+        cfg.wipe_password()
+
+        finalise(ui, cfg)
+
+        # Save the TUI log into the installed system.
+        ui.save_log("/tmp/lightarch-install.log")
+
+        done_screen(ui, cfg)
+
+    except SystemExit:
+        ui.save_log()
+        cleanup(cfg)
+        raise
+    except Exception as exc:
+        ui.save_log()
+        cleanup(cfg)
+        try:
+            ui.die(f"Unexpected error: {exc}")
+        except SystemExit:
+            raise
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except SystemExit as exc:
+        sys.exit(exc.code)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(1)
