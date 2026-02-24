@@ -3,14 +3,10 @@
 #
 #   LightArch Installer  —  0.12
 #
-#   Rewritten for stability.
 #   Inspired by tonarchy's zero-dependency robustness
-#   and omarchy's opinionated clarity.
 #
 #   Requirements:
 #     - Python 3.10+  (stdlib only)
-#     - Root
-#     - Arch Linux live ISO environment
 #
 # ============================================================
 
