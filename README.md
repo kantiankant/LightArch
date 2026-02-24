@@ -6,7 +6,7 @@ Manjaro or EndeavourOS. Ships with Hyprland, SDDM, and
 a no-nonsense installer - because GUIs are bloat and installing Arch manually takes far too long - that asks four questions and 
 gets out of your way.
 
->  LightArch 0.11 is a beta release. Expect rough edges.
+>  LightArch 0.12 is a beta release. Expect rough edges.
 > Not recommended for your primary machine yet.
 
 ## Requirements
@@ -22,7 +22,7 @@ Dependencies: `git`, `archiso`
 git clone https://github.com/kantiankant/lightarch
 cd lightarch
 sudo mkarchiso -v -w /tmp/work -o /tmp/out releng/
-cp /tmp/out/lightarch-0.11-x86_64.iso ~/
+cp /tmp/out/lightarch-0.12-x86_64.iso ~/
 ```
 
 Flash to USB with Ventoy. Boot from it.
