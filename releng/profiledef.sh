@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034
 iso_name="lightarch"
-iso_label="LIGHTARCH_0_10"
+iso_label="LIGHTARCH_0_12"
 iso_publisher="You <https://github.com/kantiankant/lightarch>"
 iso_application="LightArch"
-iso_version="0.10"
+iso_version="0.12"
 install_dir="arch"
 buildmodes=('iso')
 bootmodes=('bios.syslinux'
